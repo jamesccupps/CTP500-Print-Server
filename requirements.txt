@@ -1,0 +1,5 @@
+# For running the server or command line somewhere other than the Pi (pi/install.sh sets the Pi up by itself).
+pillow>=9
+numpy
+qrcode
+onnxruntime   # optional: the AI drawing styles, face finding and relief plaques (python -m ctp500 models)

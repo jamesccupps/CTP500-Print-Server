@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photos · CTP500</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1f6f5c">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="photos-page">
+<header class="top">
+  <a class="brand" href="/" title="Back to the printer app"><img src="icon.svg" alt="" width="28" height="28"><span>CTP500</span></a>
+  <h1 class="page-title">Photos <span id="count" class="muted"></span></h1>
+  <nav class="top-actions">
+    <button type="button" class="ghost" id="camera-btn" title="Take a photo with this phone's camera">Take photo</button>
+    <button type="button" class="ghost" id="upload-btn">Upload</button>
+    <a class="button-link" id="zip" href="/api/camera/photos.zip" download>Download all</a>
+  </nav>
+  <input type="file" id="upload-input" accept="image/*" multiple hidden>
+  <!-- capture opens the phone's camera app directly (works over plain http, unlike a live camera view) -->
+  <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+</header>
+
+<main class="gallery" id="gallery">
+  <div class="empty" id="empty" hidden>No photos yet. Take some with the camera (hold OK to send them here), or
+    upload some.</div>
+</main>
+
+<button type="button" class="fab" id="camera-fab" aria-label="Take a photo">
+  <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path fill="currentColor" d="M9 3 7.2 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9Zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10Zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></svg>
+</button>
+
+<div class="drop-overlay" id="drop-overlay" hidden>Drop photos to upload</div>
+<div class="progress page-progress" id="upload-progress" hidden><div id="upload-bar"></div></div>
+
+<div class="viewer" id="viewer" hidden>
+  <div class="viewer-bar">
+    <span id="viewer-count"></span>
+    <span class="viewer-when" id="viewer-when"></span>
+    <button type="button" class="ghost" id="viewer-close" aria-label="Close">Close</button>
+  </div>
+  <div class="viewer-stage">
+    <button type="button" class="nav prev" id="prev" aria-label="Previous photo">‹</button>
+    <img id="viewer-img" alt="">
+    <div class="viewer-paper" id="viewer-paper" hidden>
+      <img id="viewer-preview" alt="Print preview">
+      <div class="muted small" id="viewer-preview-meta"></div>
+    </div>
+    <div class="viewer-paper viewer-litho" id="viewer-litho" hidden>
+      <img id="litho-preview" alt="The lithophane, lit from behind">
+      <div class="litho-controls">
+        <select id="litho-size" title="Size of the long side">
+          <option value="60">60 mm</option>
+          <option value="80" selected>80 mm</option>
+          <option value="110">110 mm</option>
+        </select>
+        <select id="litho-shape" title="Shape">
+          <option value="flat">Flat: for a window or lightbox</option>
+          <option value="curved">Curved: stands up by itself</option>
+          <option value="relief">Relief plaque: people stand out (any color)</option>
+        </select>
+        <button type="button" class="primary" id="litho-ready" hidden
+                title="Sliced for the A1 mini by Bambu Studio on the PC: open it and press Print">Ready to print</button>
+        <a class="button-link" id="litho-download" download>Download 3D file</a>
+      </div>
+      <div class="muted small" id="litho-meta"></div>
+    </div>
+    <button type="button" class="nav next" id="next" aria-label="Next photo">›</button>
+  </div>
+  <div class="viewer-actions">
+    <select id="viewer-style" title="Print style">
+      <option value="">Camera setting</option>
+      <option value="photoline">Photo + outlines</option>
+      <option value="photo">Photo (thermal)</option>
+      <option value="line">Line drawing</option>
+      <option value="artist">Artist sketch</option>
+      <option value="coloring">Coloring page</option>
+    </select>
+    <select id="viewer-weight" title="Outline strength (Photo + outlines) / line weight">
+      <option value="">Outline: camera setting</option>
+      <option value="1">Outline: thin</option>
+      <option value="2">Outline: medium</option>
+      <option value="3">Outline: bold</option>
+    </select>
+    <select id="viewer-zoom" title="Zoom in on the faces (up to 2x closer)">
+      <option value="">Zoom: camera setting</option>
+      <option value="1">Zoom in on faces</option>
+      <option value="0">Whole photo</option>
+    </select>
+    <select id="viewer-sharpen" title="Faces redrawn sharp on the desktop PC (when its helper runs)">
+      <option value="">Faces: camera setting</option>
+      <option value="1">Faces: sharpened (PC)</option>
+      <option value="0">Faces: as taken</option>
+    </select>
+    <button type="button" class="ghost" id="viewer-preview-btn">Preview print</button>
+    <button type="button" class="primary" id="viewer-print">Print</button>
+    <button type="button" class="ghost" id="viewer-litho-btn" title="A 3D-printed panel that shows this photo when light shines through it">Lithophane</button>
+    <a class="ghost-link" id="viewer-download" download>Download</a>
+    <button type="button" class="ghost danger" id="viewer-delete">Delete</button>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="photos.js"></script>
+</body>
+</html>

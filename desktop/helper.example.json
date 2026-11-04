@@ -1,0 +1,6 @@
+{
+  "server": "http://raspberrypi.local:8500",
+  "token": "",
+  "home": "D:\\ctp500-helper",
+  "bambu_studio": "C:\\Program Files\\Bambu Studio\\bambu-studio.exe"
+}

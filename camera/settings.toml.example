@@ -1,0 +1,30 @@
+# Copy to settings.toml on the camera's CIRCUITPY drive and fill in. Keep your copy private: it holds your
+# Wi-Fi password.
+
+# Home Wi-Fi (not CIRCUITPY_WIFI_*, so the camera's Wi-Fi only comes up when it needs it)
+WIFI_SSID = "your-wifi"
+WIFI_PASSWORD = "your-wifi-password"
+
+# The print server (the Raspberry Pi): photos sync here, and PRINT mode prints here
+CAMERA_SERVER = "http://raspberrypi.local:8500/api/camera/upload"
+CAMERA_PRINTER = "http://raspberrypi.local:8500/api/camera/print"
+INSTANT_PRINT = 1          # 1 = PRINT mode at power-up (every shot prints); hold Up to toggle
+
+# Away from home Wi-Fi: the portable print box (esp32/printbox), same name and password as its secrets.h
+# CAMERA_AWAY_SSID = "CTP500 Print Box"
+# CAMERA_AWAY_PASSWORD = "choose-a-password"
+# CAMERA_AWAY_PRINTER = "http://192.168.4.1/api/camera/print"
+
+# Photo names use the local time: hours from UTC in winter, and "us" adds the summer hour on the US dates
+TZ_OFFSET = -5
+TZ_DST = "us"
+
+# The name on the start-up screen (or put a 240x240 24-bit splash.bmp on the drive)
+CAMERA_NAME = "CAMERA"
+
+# Battery saving: seconds without a button press before the screen dims; 0 = never deep sleep
+IDLE_DIM_AFTER = 90
+DEEP_SLEEP_AFTER = 0
+
+# Sensor tuning (leave out for the sensor's own): CAMERA_DENOISE 0-8, CAMERA_SHARPNESS -3..3,
+# CAMERA_AWB = "simple" (gray-world white balance, for colored LED room light)

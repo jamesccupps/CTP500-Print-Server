@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTP500 Printer</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1f6f5c">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt="" width="28" height="28"><span>CTP500</span></div>
+  <button class="status" id="status" type="button" title="Check the printer">
+    <span class="dot"></span><span id="status-text">Connecting…</span>
+  </button>
+  <nav class="top-actions">
+    <a class="ghost-nav" href="/photos" title="Browse, download, upload and print photos">Photos</a>
+    <button type="button" class="ghost" id="feed-btn" title="Feed a little paper">Feed</button>
+    <button type="button" class="ghost" data-panel="history">History</button>
+    <button type="button" class="ghost" data-panel="automate">Automate</button>
+    <button type="button" class="ghost" data-panel="settings">Settings</button>
+  </nav>
+</header>
+
+<main class="layout">
+  <section class="composer">
+    <div class="tabs" role="tablist">
+      <button role="tab" class="tab active" data-tab="note">Note</button>
+      <button role="tab" class="tab" data-tab="picture">Picture</button>
+      <button role="tab" class="tab" data-tab="qr">QR code</button>
+      <button role="tab" class="tab" data-tab="banner">Banner</button>
+      <button role="tab" class="tab" data-tab="templates">Templates</button>
+      <button role="tab" class="tab" data-tab="camera">Camera</button>
+    </div>
+
+    <!-- NOTE -->
+    <div class="pane active" data-pane="note">
+      <div class="toolbar">
+        <button type="button" data-insert="# " title="Big heading">H1</button>
+        <button type="button" data-insert="## " title="Smaller heading">H2</button>
+        <button type="button" data-insert="- [ ] " title="Checkbox">☐</button>
+        <button type="button" data-insert="- " title="Bullet">•</button>
+        <button type="button" data-insert="---" data-line title="Line">―</button>
+        <button type="button" data-wrap="**" title="Bold line"><b>B</b></button>
+        <button type="button" data-insert="> " title="White on black">▮A</button>
+        <button type="button" data-insert="[center] " title="Center this line">⇔</button>
+        <button type="button" data-insert="[qr] " title="QR code">QR</button>
+        <button type="button" data-insert="{date}" data-inline title="Today's date at print time">Date</button>
+        <span class="spacer"></span>
+        <select id="note-font" title="Font">
+          <option value="sans">Sans</option><option value="serif">Serif</option><option value="mono">Mono</option>
+        </select>
+        <select id="note-size" title="Text size">
+          <option value="18">Small</option><option value="24" selected>Medium</option>
+          <option value="30">Large</option><option value="38">Huge</option>
+        </select>
+      </div>
+      <textarea id="note" spellcheck="true" placeholder="Type anything…&#10;&#10;# Heading&#10;- [ ] a checkbox&#10;Milk ........ $3.49"></textarea>
+      <details class="help">
+        <summary>Formatting</summary>
+        <div class="help-grid">
+          <code># Title</code><span>big centered heading (## and ### are smaller)</span>
+          <code>- [ ] eggs</code><span>checkbox (<code>- [x]</code> is ticked)</span>
+          <code>- eggs</code><span>bullet</span>
+          <code>---</code><span>line (<code>- - -</code> dashed, <code>===</code> thick)</span>
+          <code>**bold**</code><span>whole line bold</span>
+          <code>&gt; Note</code><span>white text on a black bar</span>
+          <code>Milk ..... $3</code><span>left and right with dots between</span>
+          <code>[qr] link</code><span>QR code</span>
+          <code>[banner] HI</code><span>huge sideways text</span>
+          <code>[center] [right] [big] [small] [huge] [mono] [bold]</code><span>style one line</span>
+          <code>{date} {time} {weekday}</code><span>filled in when it prints</span>
+        </div>
+      </details>
+    </div>
+
+    <!-- PICTURE -->
+    <div class="pane" data-pane="picture">
+      <label class="drop" id="drop">
+        <input type="file" id="pic-file" accept="image/*" hidden>
+        <div class="drop-empty" id="drop-empty">
+          <strong>Drop a picture here</strong>
+          <span>or click to choose one, or paste with Ctrl+V</span>
+        </div>
+        <img id="pic-thumb" alt="" hidden>
+      </label>
+      <div class="grid2">
+        <label>Style
+          <select id="pic-dither">
+            <optgroup label="Photo">
+              <option value="photo">Photo (thermal)</option>
+              <option value="photoline">Photo + outlines</option>
+              <option value="floyd">Photo (fine dots)</option>
+              <option value="atkinson">Photo (crisp)</option>
+              <option value="threshold">Black and white (logos, text)</option>
+            </optgroup>
+            <optgroup label="Drawing">
+              <option value="line">Line drawing</option>
+              <option value="artist">Artist sketch</option>
+              <option value="sketch">Pencil sketch</option>
+              <option value="coloring">Coloring page</option>
+              <option value="poster">Poster</option>
+              <option value="halftone">Halftone dots</option>
+              <option value="hatch">Pen hatching</option>
+            </optgroup>
+          </select>
+        </label>
+        <label>Size
+          <select id="pic-width">
+            <option value="384">Full width</option><option value="288">Three quarters</option>
+            <option value="192">Half</option><option value="128">Third</option>
+          </select>
+        </label>
+        <label data-drawing hidden>Detail <input type="range" id="pic-detail" min="0" max="1" step="0.05" value="0.5"></label>
+        <label data-drawing hidden>Line weight
+          <select id="pic-weight"><option value="1">Thin</option><option value="2" selected>Medium</option><option value="3">Bold</option></select>
+        </label>
+        <label>Brightness <input type="range" id="pic-bright" min="0.4" max="1.8" step="0.05" value="1"></label>
+        <label>Contrast <input type="range" id="pic-contrast" min="0.4" max="2.2" step="0.05" value="1"></label>
+      </div>
+      <div class="row-opts">
+        <label class="check" title="Wide pictures print along the paper, as tall as the paper is wide"><input type="checkbox" id="pic-rotate"> Wide pictures sideways (bigger)</label>
+        <label class="check"><input type="checkbox" id="pic-auto"> Auto contrast</label>
+        <label class="check"><input type="checkbox" id="pic-invert"> Invert</label>
+        <button type="button" class="ghost small" id="pic-clear">Remove picture</button>
+      </div>
+      <label>Text above <textarea id="pic-above" rows="2" placeholder="Optional (same formatting as Note)"></textarea></label>
+      <label>Text below <textarea id="pic-below" rows="2" placeholder="Optional"></textarea></label>
+    </div>
+
+    <!-- QR -->
+    <div class="pane" data-pane="qr">
+      <div class="seg" id="qr-kind">
+        <button type="button" class="active" data-kind="link">Link or text</button>
+        <button type="button" data-kind="wifi">Wi-Fi</button>
+      </div>
+      <div data-qr="link">
+        <label>Link or text <input type="text" id="qr-data" placeholder="https://…"></label>
+      </div>
+      <div data-qr="wifi" hidden>
+        <div class="grid2">
+          <label>Network name <input type="text" id="wifi-ssid" autocomplete="off"></label>
+          <label>Password <input type="text" id="wifi-pass" autocomplete="off"></label>
+          <label>Security
+            <select id="wifi-sec"><option value="WPA">WPA/WPA2/WPA3</option><option value="WEP">WEP</option><option value="nopass">None</option></select>
+          </label>
+          <label class="check"><input type="checkbox" id="wifi-hidden"> Hidden network</label>
+        </div>
+      </div>
+      <div class="grid2">
+        <label>Size
+          <select id="qr-size"><option value="384">Large</option><option value="260" selected>Medium</option><option value="170">Small</option></select>
+        </label>
+        <label>Caption <input type="text" id="qr-caption" placeholder="Optional, e.g. Scan for Wi-Fi"></label>
+      </div>
+    </div>
+
+    <!-- BANNER -->
+    <div class="pane" data-pane="banner">
+      <label>Banner text <input type="text" id="banner-text" placeholder="HAPPY BIRTHDAY" maxlength="200"></label>
+      <div class="grid2">
+        <label>Font
+          <select id="banner-font"><option value="sans">Sans</option><option value="serif">Serif</option><option value="mono">Mono</option></select>
+        </label>
+        <label class="check"><input type="checkbox" id="banner-bold" checked> Bold</label>
+      </div>
+      <p class="hint">Prints along the paper, as tall as the paper is wide. Turn the strip sideways to read it.</p>
+    </div>
+
+    <!-- TEMPLATES -->
+    <div class="pane" data-pane="templates">
+      <div class="cards" id="templates"></div>
+    </div>
+
+    <!-- CAMERA -->
+    <div class="pane" data-pane="camera">
+      <div class="photos-head">
+        <p class="hint">Photos from the camera and uploads, as taken (full color). <b>Print</b> uses the camera print settings
+          (Settings); <b>Edit</b> opens the photo in the Picture tab to print it any other way; <b>Save</b> downloads it.</p>
+        <a class="button-link" href="/photos">Open photo browser</a>
+        <a class="button-link" id="photos-zip" href="/api/camera/photos.zip" download>Download all</a>
+      </div>
+      <div class="photos" id="photos"></div>
+    </div>
+  </section>
+
+  <aside class="output">
+    <div class="paper-wrap">
+      <div class="paper" id="paper">
+        <img id="preview" alt="Print preview" hidden>
+        <div class="paper-empty" id="paper-empty">Your print shows up here</div>
+      </div>
+    </div>
+    <div class="meta" id="meta">&nbsp;</div>
+    <div class="printbar">
+      <label>Darkness
+        <select id="darkness" title="Auto: photos print at the photo darkness (Settings), everything else at normal">
+          <option value="auto" selected>Auto</option>
+          <option value="light">Light</option><option value="normal">Normal</option>
+          <option value="dark">Dark</option><option value="darkest">Darkest</option>
+        </select>
+      </label>
+      <label>Copies <input type="number" id="copies" min="1" max="20" value="1"></label>
+      <button type="button" class="primary" id="print-btn" disabled>Print</button>
+    </div>
+    <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
+  </aside>
+</main>
+
+<!-- side panels -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="panel" id="panel-history" hidden>
+  <div class="panel-head"><h2>History</h2><button type="button" class="ghost" data-close>Close</button></div>
+  <div id="history-list" class="history"></div>
+</aside>
+<aside class="panel" id="panel-automate" hidden>
+  <div class="panel-head"><h2>Automate</h2><button type="button" class="ghost" data-close>Close</button></div>
+  <div class="automate" id="automate"></div>
+</aside>
+
+<aside class="panel" id="panel-settings" hidden>
+  <div class="panel-head"><h2>Settings</h2><button type="button" class="ghost" data-close>Close</button></div>
+  <div class="settings">
+    <p class="hint">Saved on the print server, so they apply to every print: this app, Home Assistant and scripts.</p>
+    <h3>Blank paper around each print</h3>
+    <div class="setting">
+      <label for="pad-top">Top</label>
+      <div class="stepper">
+        <button type="button" data-step="pad-top" data-by="-1" aria-label="Less top padding">−</button>
+        <input type="number" id="pad-top" min="0" max="50" step="1" inputmode="decimal">
+        <span>mm</span>
+        <button type="button" data-step="pad-top" data-by="1" aria-label="More top padding">+</button>
+      </div>
+    </div>
+    <div class="setting">
+      <label for="pad-bottom">Bottom</label>
+      <div class="stepper">
+        <button type="button" data-step="pad-bottom" data-by="-1" aria-label="Less bottom padding">−</button>
+        <input type="number" id="pad-bottom" min="0" max="50" step="1" inputmode="decimal">
+        <span>mm</span>
+        <button type="button" data-step="pad-bottom" data-by="1" aria-label="More bottom padding">+</button>
+      </div>
+    </div>
+    <p class="hint">The bottom is what's left under the last line after you tear it off. The paper above the print
+      also includes what was left from the last tear.</p>
+    <h3>Photos</h3>
+    <div class="setting">
+      <label for="photo-look">Photo tones</label>
+      <select id="photo-look">
+        <option value="punchy">Punchy (more contrast)</option><option value="even">Even (more gray steps)</option>
+      </select>
+    </div>
+    <p class="hint">Punchy keeps light areas clean and shadows bold: best for dim shots. Even prints lighter, with
+      the gray steps measured on this printer kept apart: try it for bright, detailed photos.</p>
+    <h3>Camera prints</h3>
+    <div class="setting">
+      <label for="cam-style">Style</label>
+      <select id="cam-style">
+        <option value="line">Line drawing</option><option value="artist">Artist sketch</option>
+        <option value="sketch">Pencil sketch</option>
+        <option value="coloring">Coloring page</option><option value="poster">Poster</option>
+        <option value="halftone">Halftone dots</option><option value="hatch">Pen hatching</option>
+        <option value="photo">Photo (thermal)</option><option value="photoline">Photo + outlines</option>
+        <option value="floyd">Photo (fine dots)</option><option value="atkinson">Photo (crisp)</option>
+      </select>
+    </div>
+    <div class="setting">
+      <label for="cam-detail">Detail</label>
+      <input type="range" id="cam-detail" min="0" max="1" step="0.05">
+    </div>
+    <div class="setting">
+      <label for="cam-weight">Outline strength</label>
+      <select id="cam-weight"><option value="1">Thin</option><option value="2">Medium</option><option value="3">Bold</option></select>
+    </div>
+    <div class="setting">
+      <label for="cam-frame">Instant-photo frame</label>
+      <input type="checkbox" id="cam-frame">
+    </div>
+    <div class="setting">
+      <label for="cam-sideways">Print sideways (bigger)</label>
+      <input type="checkbox" id="cam-sideways">
+    </div>
+    <div class="setting">
+      <label for="cam-zoom" title="Crops to the people's heads and shoulders, up to 2x closer">Zoom in on faces</label>
+      <input type="checkbox" id="cam-zoom">
+    </div>
+    <div class="setting">
+      <label for="cam-sharpen" title="Faces redrawn sharp by a face restoration model (GFPGAN) on the desktop PC's graphics card, while its helper runs; with the PC off, photos print as taken">Sharpen faces (PC)</label>
+      <input type="checkbox" id="cam-sharpen">
+    </div>
+    <div class="setting">
+      <label for="cam-caption">Caption</label>
+      <input type="text" id="cam-caption" maxlength="60" placeholder="{date}">
+    </div>
+    <p class="hint">The caption goes under the photo inside the frame. {date}, {time} and {weekday} fill in.</p>
+    <div class="settings-preview">
+      <img id="cam-preview" alt="Your newest photo with these settings" hidden>
+      <div class="hint" id="cam-preview-meta">Take or upload a photo to see a preview here.</div>
+    </div>
+  </div>
+</aside>
+
+<div class="toasts" id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.venv/
+*.log
+
+# AI models: downloaded by `python -m ctp500 models` (SHA-256 checked), not kept in git
+/models/
+
+# private notes and local files
+/CLAUDE.md
+/IDEAS.md
+/.claude/
+/examples/
+/result.json
+/*.png
+
+# secrets and machine settings (each has a *.example next to it)
+camera/settings.toml
+desktop/helper.json
+esp32/printbox/secrets.h
+esp32/arduino-cli.yaml
+
+# Arduino libraries and build output
+esp32/arduino-user/
+esp32/build/
+esp32/*/build/
