@@ -1,5 +1,9 @@
 # CTP500 Print Server
 
+[![Tests](https://github.com/jamesccupps/CTP500-Print-Server/actions/workflows/tests.yml/badge.svg)](https://github.com/jamesccupps/CTP500-Print-Server/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/release/jamesccupps/CTP500-Print-Server)](https://github.com/jamesccupps/CTP500-Print-Server/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Your own app for the **CTP500 Bluetooth thermal printer** (the pocket thermal printer sold by Core Innovations):
 a print server for a Raspberry Pi, a web app for any phone or computer, an instant-camera app for the
 **Adafruit MEMENTO**, a command line, and an HTTP API for automations. No account, no cloud, no app store.

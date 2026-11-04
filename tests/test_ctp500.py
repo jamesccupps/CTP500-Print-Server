@@ -494,8 +494,8 @@ class ServerTests(unittest.TestCase):
         status = json.loads(self.call("/api/status")[1])["helper"]
         self.assertEqual((status["online"], status["name"], status["kinds"]),
                          (True, "test", ["draw", "restore", "slice"]))
-        code, body, _ = self.call(f"/api/camera/litho/{name}.3mf?shape=relief&size=80")
-        self.assertEqual((code, body, seen["slice"]["shape"]), (200, b"PK-sliced", "relief"))
+        code, body, _ = self.call(f"/api/camera/litho/{name}.3mf?shape=flat&size=80")   # (relief needs the models)
+        self.assertEqual((code, body, seen["slice"]["shape"]), (200, b"PK-sliced", "flat"))
         sharp = render.SHARPEN(Image.new("RGB", (64, 48), (9, 99, 199)))         # the PC's picture comes back
         self.assertEqual((sharp.size, seen["restore"]), ((64, 48), {"model": "gfpgan_1.4"}))
         code, body, headers = self.call(f"/api/camera/litho/{name}.3mf?size=60&shape=curved")

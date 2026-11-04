@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python ${{ matrix.python }}${{ matrix.models && ', AI models' || '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: ubuntu-latest, python: "3.12", models: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Fonts, as on a Pi
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q fonts-dejavu-core
+      - run: pip install -r requirements.txt
+      - name: AI models (cached; checked against their SHA-256s)
+        if: matrix.models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-${{ hashFiles('ctp500/ai.py') }}
+      - if: matrix.models
+        run: python -m ctp500 models
+      - name: Scripts parse
+        if: runner.os == 'Linux'
+        run: |
+          sh -n pi/install.sh pi/join-wifi.sh
+          python -m py_compile camera/code.py camera/install.py desktop/*.py tools/*.py
+      - run: python -m unittest discover -s tests
