@@ -6,7 +6,8 @@
 
 Your own app for the **CTP500 Bluetooth thermal printer** (the pocket thermal printer sold by Core Innovations):
 a print server for a Raspberry Pi, a web app for any phone or computer, an instant-camera app for the
-**Adafruit MEMENTO**, a command line, and an HTTP API for automations. No account, no cloud, no app store.
+**Adafruit MEMENTO**, a command line, and an HTTP API for automations. No account, no cloud, no app store. It can
+also run a **Phomemo M02 Pro** sticker printer alongside the CTP500.
 
 ![Example prints: a shopping list with a QR code, a framed photo, a line drawing, a photo, a banner](docs/images/prints.png)
 
@@ -19,6 +20,7 @@ a print server for a Raspberry Pi, a web app for any phone or computer, an insta
 - **An instant camera:** shoot on a MEMENTO and it prints; every photo also lands in the server's photo gallery.
 - **Lithophanes and relief plaques** for a 3D printer, from any photo.
 - **Printer alerts:** out of paper or lid open? The print waits, retries, and can send your phone a notification.
+- **Two printers:** add a Phomemo M02 Pro (300 dpi, sticker paper) and pick the printer for each print.
 - **Automations:** Home Assistant, scripts, `curl`: anything that can send an HTTP request can print.
 
 ```
@@ -32,6 +34,7 @@ a print server for a Raspberry Pi, a web app for any phone or computer, an insta
 | | |
 |---|---|
 | **Printer** | A CTP500. Some speak the "cat printer" protocol (tested; they show up as `Mini Printer-…`), others ESC/POS; the server works out which. |
+| **Second printer** (optional) | A [Phomemo M02 Pro](#a-second-printer-phomemo-m02-pro) (300 dpi; plain or sticker paper, 50 or 53 mm). |
 | **Server** | A Raspberry Pi with Bluetooth (tested: Pi 5 on 64-bit Raspberry Pi OS / Debian 13), or any Debian-style Linux with Bluetooth and Python 3.10+. |
 | **Camera** (optional) | An [Adafruit MEMENTO](https://www.adafruit.com/product/5420) (product 5420: ESP32-S3 + OV5640 autofocus camera), a microSD card and a LiPo battery. [Guide](camera/README.md) |
 | **Print box** (optional) | An ESP32-S3 "N16R8" board on a USB power bank: prints camera and phone photos away from home. [Guide](esp32/README.md) |
@@ -54,7 +57,7 @@ ends with the web app's address:
 
 ```
 Ready. Open the web app on any phone or computer on this network:
-    http://192.168.1.50:8500    (or http://raspberrypi.local:8500)
+    http://192.0.2.50:8500    (or http://raspberrypi.local:8500)
 ```
 
 Open it, type a note, press **Print**. No printer yet? It runs with a simulated one (prints show up in History);
@@ -73,6 +76,31 @@ The first command shows the token. The web app asks for it once per browser; scr
 [Tailscale](https://tailscale.com) on the Pi and your phone works well.
 
 **Update:** `cd ~/ctp500 && git pull && ./pi/install.sh` (your settings and photos stay).
+
+### A second printer: Phomemo M02 Pro
+
+Switch the M02 Pro on (with its phone app closed), then on the Pi:
+
+```sh
+cd ~/ctp500 && python3 -m ctp500 add-printer m02pro
+sudo systemctl restart ctp500
+```
+
+It finds the printer, pairs it and saves it (or give the address: `add-printer m02pro AA:BB:CC:DD:EE:FF`). The
+web app and the Photos page then show a **Printer** menu, Settings picks which printer camera prints go to, and
+the API takes `"printer": "m02pro"`. A print is the same size on either printer; the M02 Pro draws it at its
+own 300 dpi, so it comes out sharper. `python3 -m ctp500 printers` lists them; `remove-printer m02pro` takes it
+out again.
+
+Paper: Phomemo's 50 mm rolls (the sticker paper) are barely wider than the M02 Pro's print head and shift about a
+millimeter sideways between prints, so prints there are 45 mm wide with paper to spare on both sides. On 53 mm
+paper, `add-printer m02pro --paper 53` prints the head's full 48 mm.
+
+Tested on a real M02 Pro (firmware 0.0.4) with Phomemo's 50 mm paper. Its 300 dpi dots are much finer than the
+CTP500's and print lone dots weakly, so photos are drawn differently there: a little smoothing, sharpening that
+leaves the grain alone, dots grouped in small clumps, darker middle tones, and darkest heat unless you pick a
+darkness. Text, QR codes and drawings print at the full 300 dpi. Like the CTP500, it reports an open lid as "out
+of paper".
 
 ## The web app
 
@@ -176,7 +204,8 @@ python -m ctp500 banner HAPPY BIRTHDAY
 python -m ctp500 --preview out.png text "check the layout without printing"
 ```
 
-On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints directly without a server.
+On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints directly without a server (add
+`--model m02pro` for an M02 Pro). With two printers, `--printer m02pro` picks one by its id.
 
 ## Settings
 
@@ -186,6 +215,7 @@ On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints direc
 | Setting | |
 |---|---|
 | `printer`, `protocol` | the printer's Bluetooth address; `auto` (default), `cat` or `escpos` |
+| `printers`, `camera_printer` | more printers (`add-printer` fills this in: `[{"model": "m02pro", "address": "..."}]`, optional `id`, `name`, `channel`, `feed`); the id of the printer camera prints go to (default: the main one) |
 | `port`, `token` | the web app's port (8500); a token to require (above) |
 | `darkness`, `feed`, `padding_top_mm`, `padding_bottom_mm` | print darkness; paper fed at the end; blank paper around prints (6 mm) |
 | `photo_look` | `punchy` (default: clean light areas, bold shadows) or `even` (more gray steps, prints at Light) |
@@ -204,13 +234,15 @@ On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints direc
   goes out by itself (for 30 minutes), or cancel it in History.
 - **No AI styles** (line drawings look like plain edges): `cd ~/ctp500 && .venv/bin/python -m ctp500 models`. The AI
   needs a 64-bit OS.
+- **The M02 Pro doesn't connect:** it must be paired (`add-printer` does that) and not connected to its phone
+  app. The server tries its Bluetooth channels until one answers; `journalctl -u ctp500 -f` shows what happens.
 - **The web app doesn't open:** `systemctl status ctp500` and `journalctl -u ctp500 -f` show what's wrong.
 
 ## How it works
 
 The Pi holds a classic Bluetooth serial connection (RFCOMM) to the printer while there's a job, and lets go 45 s
-later so the phone app can still use it. Every print is drawn as one 384-dot-wide, 1-bit picture (8 dots per mm)
-and sent in the printer's own dialect. Photos are prepared for this printer's dot gain, measured from a printed
+later so the phone app can still use it. Every print is drawn as one 1-bit picture as wide as the paper (384
+dots, 8 per mm, on the CTP500; 300 dpi on the M02 Pro: 536 dots on 50 mm paper, 576 on 53 mm) and sent in the printer's own dialect. Photos are prepared for this printer's dot gain, measured from a printed
 calibration strip (`tools/calibration_strip.py`): Normal, Dark and Darkest print the same and merge everything past
 ~60% gray into black, so the Punchy look lifts midtones and Even prints at Light. Before each print the server asks
 the printer's state, so an empty roll or an open lid fails with a reason instead of losing the print.
@@ -224,7 +256,9 @@ MIT licensed (see [LICENSE](LICENSE)).
 Printer protocol: [thirtythreedown/CTP500PrinterApp](https://github.com/thirtythreedown/CTP500PrinterApp),
 [parkerlreed's gist](https://gist.github.com/parkerlreed/8f77bdb08e260b5d0fe795e70d8fd6b0),
 [Dejniel/TiMini-Print](https://github.com/Dejniel/TiMini-Print) and
-[NaitLee/Cat-Printer](https://github.com/NaitLee/Cat-Printer).
+[NaitLee/Cat-Printer](https://github.com/NaitLee/Cat-Printer). Phomemo M02 Pro: TiMini-Print,
+[vivier/phomemo-tools](https://github.com/vivier/phomemo-tools) and
+[theacodes/phomemo_m02s](https://github.com/theacodes/phomemo_m02s).
 
 AI models, downloaded on first use and checked against pinned SHA-256s (none are included here):
 
@@ -237,5 +271,5 @@ AI models, downloaded on first use and checked against pinned SHA-256s (none are
 
 The camera app runs on Adafruit's CircuitPython libraries (MIT); the print box uses
 [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) and [JPEGDEC](https://github.com/bitbank2/JPEGDEC)
-(both Apache-2.0). CTP500, MEMENTO and Bambu Lab are their owners' trademarks; this project isn't affiliated with
-any of them.
+(both Apache-2.0). CTP500, Phomemo, MEMENTO and Bambu Lab are their owners' trademarks; this project isn't
+affiliated with any of them.

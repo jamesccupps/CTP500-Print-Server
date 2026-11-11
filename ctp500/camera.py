@@ -219,6 +219,79 @@ def fix_stuck_pixel(data: bytes, where=None) -> bytes:
         return data                                    # never lose a photo over this
 
 
+# Column streaks (2026-11-11): in dim light the MEMENTO's sensor adds thin full-height streaks, columns sitting up
+# to ~46 levels off their neighbours (a dim 1600x1200 shot: spread 4.7 levels, the same in the top and bottom
+# half, correlation 0.96). Camera prints are turned sideways, so they print as lines across the paper; the CTP500's
+# spreading dots hid them, the M02 Pro's 300 dpi shows every one. Clean photos measure ~0.4 (camera, 1024 wide)
+# to ~1.6 (a phone photo, not consistent top to bottom), so only a strong, consistent pattern is taken out.
+STREAKS_MIN = 2.5          # spread of the column offsets (levels) worth taking out
+STREAKS_SAME = 0.85        # how alike the top and bottom halves' offsets must be (a sensor's pattern, not content)
+
+
+def _column_offsets(a, rows: slice, half: int = 4):
+    """Per column and channel: the median, down the rows, of how far it sits from the median of its 2 x half
+    neighbours (itself left out)."""
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
+    sub = a[rows]
+    pad = np.pad(sub, ((0, 0), (half, half), (0, 0)), mode="edge")
+    win = sliding_window_view(pad, 2 * half + 1, axis=1)
+    neighbours = np.concatenate([win[..., :half], win[..., half + 1:]], axis=-1)
+    return np.median(sub - np.median(neighbours, axis=-1), axis=0)
+
+
+def destripe(img: Image.Image) -> Image.Image:
+    """The picture without a camera sensor's column streaks, or the same picture when it has none (phone
+    photos and clean shots come back untouched)."""
+    try:
+        import numpy as np
+    except ImportError:
+        return img
+    if img.mode not in ("RGB", "L") or min(img.size) < 64:
+        return img
+    a = np.asarray(img.convert("RGB"), dtype=np.float32)
+    h = a.shape[0]
+    step = max(1, h // 200)                         # ~200 rows each half are plenty for a median
+    top = _column_offsets(a, slice(0, h // 2, step))
+    bottom = _column_offsets(a, slice(h // 2, h, step))
+    offsets = (top + bottom) / 2
+    if offsets.std() < STREAKS_MIN or np.corrcoef(top.ravel(), bottom.ravel())[0, 1] < STREAKS_SAME:
+        return img
+    a -= offsets[None]
+    a -= _bands(a, step)[None, :, None]
+    out = Image.fromarray(np.clip(np.rint(a), 0, 255).astype(np.uint8), "RGB")
+    return out.convert(img.mode) if img.mode != "RGB" else out
+
+
+# The same sensor also leaves wider, fainter bands (~20-40 columns at 1600 wide, up to ~9 levels, top and bottom
+# half agreeing 0.84; clean shots 0.3-0.7). The photo styles lift the shadows, where they showed as bands across
+# the start of the print. Only taken out after the streaks were found (so it's that sensor), when the halves agree.
+BANDS_WIDTH = 41           # columns at 1600 wide: what a band is measured against
+BANDS_SAME = 0.75
+
+
+def _bands(a, step: int):
+    """Per column: the brightness the wide bands add (0 where the halves don't agree)."""
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
+    w = a.shape[1]
+    lum = a[::max(1, a.shape[0] // 400), :w - w % 2].mean(axis=2)   # ~400 rows: fewer don't agree reliably
+    lum = (lum[:, 0::2] + lum[:, 1::2]) / 2                     # half the columns: plenty for bands this wide
+    k = max(5, round(BANDS_WIDTH * w / 3200)) | 1
+    pad = np.pad(lum, ((0, 0), (k // 2, k // 2)), mode="edge")
+    res = lum - np.median(sliding_window_view(pad, k, axis=1), axis=-1)   # a running mean followed edges
+    half = res.shape[0] // 2
+
+    def smooth(p):                                              # the fine streaks are gone; keep what's wide
+        return np.convolve(np.pad(p, 1, mode="edge"), np.ones(3) / 3, mode="valid")
+    top, bottom = smooth(np.median(res[:half], axis=0)), smooth(np.median(res[half:], axis=0))
+    with np.errstate(invalid="ignore", divide="ignore"):      # a flat profile has no agreement to measure
+        agree = np.corrcoef(top, bottom)[0, 1]
+    if not agree >= BANDS_SAME:
+        return np.zeros(w, np.float32)
+    return np.interp(np.arange(w), np.arange(len(top)) * 2 + 0.5, (top + bottom) / 2)
+
+
 def _clean_name(name: str | None) -> str:
     """A safe .jpg file name from whatever the uploader called it."""
     stem = os.path.splitext(os.path.basename(str(name or "").replace("\\", "/")))[0]

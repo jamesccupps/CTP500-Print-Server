@@ -7,16 +7,20 @@ import shutil
 import subprocess
 import sys
 
+from . import printers
+
 # Names the CTP500 and its clones advertise (from TiMini-Print's catalog, plus the model name itself).
-NAME_HINTS = ("CTP500", "CTP-500", "Mini Printer", "CorePrint", "Core Print", "Teal Printer", "Purple Printer", "B Pink Printer",
-              "Cherry Printer", "Floral Printer", "Check Printer", "Smiley Printer", "Stone Printer",
-              "P Pink Printer", "YHK")
+NAME_HINTS = printers.CTP500.names
 _ADDR = re.compile(r"([0-9A-F]{2}(?::[0-9A-F]{2}){5})", re.I)
 
 
 def looks_like_ctp500(name: str) -> bool:
-    low = (name or "").lower()
-    return any(low.startswith(h.lower()) or h.lower() in low for h in NAME_HINTS)
+    return printers.guess(name) is printers.CTP500
+
+
+def _model(name: str) -> str | None:
+    found = printers.guess(name)
+    return found.key if found else None
 
 
 def _run(args: list[str], timeout: float) -> str:
@@ -28,7 +32,8 @@ def _run(args: list[str], timeout: float) -> str:
 
 
 def scan(seconds: int = 12) -> list[dict]:
-    """[{address, name, likely, paired}] for nearby (Linux) or paired (Windows) devices."""
+    """[{address, name, likely (a CTP500), model (printers.MODELS key or None), paired}] for nearby (Linux) or paired
+    (Windows) devices."""
     if sys.platform.startswith("linux"):
         return _scan_linux(seconds)
     if sys.platform == "win32":
@@ -46,8 +51,9 @@ def _scan_linux(seconds: int) -> list[dict]:
         m = re.match(r"Device\s+([0-9A-F:]{17})\s+(.*)", line.strip(), re.I)
         if m:
             addr, name = m.group(1).upper(), m.group(2).strip()
-            found.append({"address": addr, "name": name, "likely": looks_like_ctp500(name), "paired": addr in paired})
-    found.sort(key=lambda d: (not d["likely"], d["name"].lower()))
+            found.append({"address": addr, "name": name, "likely": looks_like_ctp500(name), "paired": addr in paired,
+                          "model": _model(name)})
+    found.sort(key=lambda d: (not d["model"], d["name"].lower()))
     return found
 
 
@@ -66,8 +72,9 @@ def _paired_windows() -> list[dict]:
             continue
         raw = m.group(1).upper()
         addr = ":".join(raw[i:i + 2] for i in range(0, 12, 2))
-        found.append({"address": addr, "name": name.strip(), "likely": looks_like_ctp500(name), "paired": True})
-    found.sort(key=lambda d: (not d["likely"], d["name"].lower()))
+        found.append({"address": addr, "name": name.strip(), "likely": looks_like_ctp500(name), "paired": True,
+                      "model": _model(name)})
+    found.sort(key=lambda d: (not d["model"], d["name"].lower()))
     return found
 
 
@@ -77,7 +84,19 @@ def pair(address: str) -> str:
         raise RuntimeError("pair the printer in Windows Settings > Bluetooth & devices instead")
     if not shutil.which("bluetoothctl"):
         raise RuntimeError("bluetoothctl isn't installed (sudo apt install bluez)")
-    out = []
-    for cmd in (["pair", address], ["trust", address]):
-        out.append(_run(["bluetoothctl", "--timeout", "20", *cmd], 30).strip())
-    return "\n".join(o for o in out if o)
+    out, steps = [], (["pair", address], ["trust", address])
+    if "Paired: yes" in _run(["bluetoothctl", "info", address], 10):   # set up again (another paper, say)
+        out, steps = ["already paired"], steps[1:]
+    for cmd in steps:
+        out.extend(_answers(_run(["bluetoothctl", "--timeout", "20", *cmd], 30)))
+    return "\n".join(out)
+
+
+_COLOR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _answers(text: str) -> list[str]:
+    """bluetoothctl's own answers ("Pairing successful", "Failed to pair: ..."), without its colors and the
+    [CHG]/[NEW]/[DEL] events it prints for every device it hears meanwhile."""
+    lines = (_COLOR.sub("", line).strip() for line in text.splitlines())
+    return [line for line in lines if line and not line.startswith("[")]

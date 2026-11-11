@@ -9,6 +9,8 @@ const state = {
   qrKind: "link",
   lastDoc: "",
   printing: null,       // job id being watched
+  printers: [],         // from /api/status: [{id, label, model, ...}], the main one first
+  status: null,         // the last /api/status
   previewSeq: 0,
 };
 
@@ -128,6 +130,7 @@ async function updatePreview() {
   }
   // photo tones are tuned to the darkness they print at, so the preview needs it too
   if ($("#darkness").value !== "auto") doc.darkness = $("#darkness").value;
+  if (pickedPrinter()) doc.printer = pickedPrinter();   // drawn for that printer's paper
   const key = JSON.stringify(doc);
   if (key === state.lastDoc) return;
   const seq = ++state.previewSeq;
@@ -160,6 +163,7 @@ async function doPrint() {
   btn.disabled = true;
   try {
     if ($("#darkness").value !== "auto") doc.darkness = $("#darkness").value;
+    if (pickedPrinter()) doc.printer = pickedPrinter();
     doc.copies = Math.max(1, Math.min(20, Number($("#copies").value) || 1));
     const { job } = await api("/api/print", { method: "POST", body: doc });
     state.printing = job.id;
@@ -187,6 +191,8 @@ async function pollStatus(soon = false) {
   let next = 4000;
   try {
     const s = await api("/api/status");
+    state.status = s;
+    fillPrinters(s);
     renderStatus(s);
     if (state.printing) {
       next = 600;
@@ -203,7 +209,7 @@ async function pollStatus(soon = false) {
         showProgress(null);
         if (done.status === "done") toast("Printed");
         else if (done.status === "failed") toast(done.error || "The print failed", "error");
-        else if (done.status === "cancelled") toast("Cancelled");
+        else if (done.status === "cancelled") toast("Canceled");
         if (!$("#panel-history").hidden) loadHistory();
       }
     }
@@ -214,23 +220,55 @@ async function pollStatus(soon = false) {
   statusTimer = setTimeout(pollStatus, soon ? 300 : next);
 }
 
+// ------------------------------------------------------------------ printers
+
+// The printer picked here ("" with only one printer: the server's main one).
+function pickedPrinter() {
+  return state.printers.length > 1 ? $("#printer").value : "";
+}
+
+function printerById(s, id) {
+  return (s.printers || []).find(p => p.id === id) || s.printer;
+}
+
+// With more than one printer: the Printer picker next to Darkness, and the camera's printer in Settings.
+function fillPrinters(s) {
+  const list = s.printers || [s.printer];
+  const ids = list.map(p => p.id + "|" + p.label).join(",");
+  if (ids === state.printerIds) return;
+  state.printerIds = ids;
+  state.printers = list;
+  const several = list.length > 1;
+  $("#printer-pick").hidden = !several;
+  $("#cam-printer-row").hidden = !several;
+  const pick = $("#printer");
+  pick.replaceChildren(...list.map(p => new Option(p.label, p.id)));
+  const stored = store.get("printer", list[0].id);
+  pick.value = list.some(p => p.id === stored) ? stored : list[0].id;
+  const cam = $("#cam-printer"), camValue = cam.value;
+  cam.replaceChildren(new Option(`${list[0].label} (main)`, ""), ...list.slice(1).map(p => new Option(p.label, p.id)));
+  cam.value = camValue;
+  if (several) { state.lastDoc = ""; schedulePreview(0); }
+}
+
 function renderStatus(s, error) {
   const pill = $("#status"), text = $("#status-text");
   pill.className = "status";
   if (!s) { pill.classList.add("bad"); text.textContent = "Server offline"; pill.title = error || ""; return; }
-  const p = s.printer;
-  pill.title = p.last_error || p.name;
-  const waiting = (s.queue || []).find(j => j.status === "waiting");
+  const p = printerById(s, pickedPrinter() || s.printer.id);
+  pill.title = (state.printers.length > 1 ? p.label + ": " : "") + (p.last_error || p.name);
+  const queue = (s.queue || []).filter(j => !j.printer || j.printer === p.id);
+  const waiting = queue.find(j => j.status === "waiting");
   if (waiting) {
     pill.classList.add("bad"); pill.title = waiting.error || "";
-    text.textContent = problemText(p.last_status, true) ? `Waiting: ${problemText(p.last_status, true)}` : "Waiting for the printer";
+    text.textContent = problemText(p.last_status, true, p) ? `Waiting: ${problemText(p.last_status, true, p)}` : "Waiting for the printer";
   }
-  else if (p.state === "printing" || (s.queue || []).length) { pill.classList.add("busy"); text.textContent = "Printing…"; }
+  else if (p.state === "printing" || queue.length) { pill.classList.add("busy"); text.textContent = "Printing…"; }
   else if (p.state === "connecting") { pill.classList.add("busy"); text.textContent = "Connecting…"; }
   else if (p.state === "error") { pill.classList.add("bad"); text.textContent = "Printer not reachable"; }
-  else if (problemText(p.last_status, true)) {
+  else if (problemText(p.last_status, true, p)) {
     // from the last time the printer was asked; tapping the pill asks again
-    pill.classList.add("bad"); text.textContent = problemText(p.last_status, true); pill.title = "Tap to check again";
+    pill.classList.add("bad"); text.textContent = problemText(p.last_status, true, p); pill.title = "Tap to check again";
   }
   else if (p.simulated) { pill.classList.add("ok"); text.textContent = "Simulated printer"; }
   else if (p.connected) { pill.classList.add("ok"); text.textContent = "Connected"; }
@@ -239,9 +277,10 @@ function renderStatus(s, error) {
 
 const PROBLEMS = { out_of_paper: "Out of paper or lid open", lid_open: "Lid open", overheated: "Too hot, cooling down",
   low_battery: "Battery low" };
-function problemText(status, blockingOnly = false) {
+function problemText(status, blockingOnly = false, printer = null) {
   const list = (status && status.problems) || [];
   const shown = list.filter(p => !blockingOnly || p === "out_of_paper" || p === "lid_open");
+  // both printers report an open lid as "no paper" (the M02 Pro's own lid flag stayed "closed", 2026-11-11)
   return shown.map(p => PROBLEMS[p] || `Problem (${p})`).join(", ");
 }
 
@@ -249,11 +288,15 @@ async function checkPrinter() {
   const text = $("#status-text");
   text.textContent = "Checking…";
   try {
-    const r = await api("/api/check", { method: "POST" });
+    const which = pickedPrinter() ? "?printer=" + encodeURIComponent(pickedPrinter()) : "";
+    const r = await api("/api/check" + which, { method: "POST" });
     const st = r.status || {};
     if (r.printer.simulated) toast("Simulated printer is fine");
-    else if (problemText(st)) toast(`The printer says: ${problemText(st)}`, "error");
-    else toast(st.firmware ? `Printer OK · firmware ${st.firmware}` : "Connected to the printer");
+    else if (problemText(st, false, r.printer)) toast(`The printer says: ${problemText(st, false, r.printer)}`, "error");
+    else {
+      const extra = [st.firmware && `firmware ${st.firmware}`, st.battery != null && `battery ${st.battery}%`].filter(Boolean);
+      toast(extra.length ? `Printer OK · ${extra.join(" · ")}` : "Connected to the printer");
+    }
   } catch (err) {
     toast(err.message, "error");
   }
@@ -453,6 +496,7 @@ const SETTING_INPUTS = {          // input id -> [server setting, kind]
   "cam-zoom": ["camera_zoom", "bool"],
   "cam-sharpen": ["camera_sharpen", "bool"],
   "cam-caption": ["camera_caption", "text"],
+  "cam-printer": ["camera_printer", "text"],
 };
 
 async function loadSettings() {
@@ -539,7 +583,8 @@ async function loadHistory() {
       row.querySelector("img").src = j.preview;
       row.querySelector(".title").textContent = j.title || "Print";
       const sub = row.querySelector(".sub");
-      sub.textContent = `${timeAgo(j.created)} · ${j.length_mm} mm · ${j.source}` + (j.copies > 1 ? ` · ${j.copies} copies` : "") + " · ";
+      const on = state.printers.length > 1 && j.printer ? ` · ${(state.printers.find(p => p.id === j.printer) || {}).label || j.printer}` : "";
+      sub.textContent = `${timeAgo(j.created)} · ${j.length_mm} mm · ${j.source}${on}` + (j.copies > 1 ? ` · ${j.copies} copies` : "") + " · ";
       const st = document.createElement("span");
       st.textContent = j.status === "failed" || j.status === "waiting" ? `${j.status}: ${j.error || ""}` : j.status;
       if (j.status === "failed" || j.status === "waiting") st.className = "failed";
@@ -617,6 +662,10 @@ function init() {
   $("#note-font").addEventListener("change", e => { store.set("font", e.target.value); schedulePreview(0); });
   $("#note-size").addEventListener("change", e => { store.set("size", e.target.value); schedulePreview(0); });
   $("#darkness").addEventListener("change", e => { store.set("darkness2", e.target.value); state.lastDoc = ""; schedulePreview(0); });
+  $("#printer").addEventListener("change", e => {
+    store.set("printer", e.target.value); state.lastDoc = ""; schedulePreview(0);
+    if (state.status) renderStatus(state.status);
+  });
 
   // every other input re-renders the preview
   $$(".pane input, .pane select, .pane textarea").forEach(el => {
@@ -660,7 +709,8 @@ function init() {
   });
   $("#status").addEventListener("click", checkPrinter);
   $("#feed-btn").addEventListener("click", async () => {
-    try { await api("/api/feed?lines=3", { method: "POST" }); } catch (err) { toast(err.message, "error"); }
+    const which = pickedPrinter() ? "&printer=" + encodeURIComponent(pickedPrinter()) : "";
+    try { await api("/api/feed?lines=3" + which, { method: "POST" }); } catch (err) { toast(err.message, "error"); }
   });
   $$("[data-panel]").forEach(b => b.addEventListener("click", () => openPanel(b.dataset.panel)));
   Object.keys(SETTING_INPUTS).forEach(id => {

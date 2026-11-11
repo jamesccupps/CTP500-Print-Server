@@ -14,7 +14,8 @@
     POST /api/jobs/<id>/cancel
 
 Print calls answer at once with the job; add ?wait=1 to answer after it has printed.
-Options for every print call (JSON keys or query parameters): darkness, copies, feed.
+Options for every print call (JSON keys or query parameters): darkness, copies, feed, printer (an id from
+/api/status "printers"; the main printer when left out). Each printer has its own queue.
 """
 
 from __future__ import annotations
@@ -39,13 +40,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image
 
-from . import __version__, camera, catproto, config, litho, markup, offload, protocol, raster, render
+from . import __version__, camera, config, litho, markup, offload, protocol, raster, render
 from .printer import Printer, PrinterNotReady
 from .transport import Cancelled, TransportError
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_BODY = 40 * 1024 * 1024
-CAMERA_OVERRIDES = ("style", "detail", "weight", "frame", "caption", "sideways", "zoom", "sharpen")
+CAMERA_OVERRIDES = ("style", "detail", "weight", "frame", "caption", "sideways", "zoom", "sharpen", "printer")
 IMAGE_OPTIONS = ("dither", "style", "detail", "weight", "brightness", "contrast", "width", "rotate", "threshold",
                  "auto_contrast", "invert", "align")
 
@@ -53,9 +54,11 @@ IMAGE_OPTIONS = ("dither", "style", "detail", "weight", "brightness", "contrast"
 class Job:
     _ids = itertools.count(1)
 
-    def __init__(self, doc: dict, source: str, title: str):
+    def __init__(self, doc: dict, source: str, title: str, printer: Printer):
         self.id = f"{time.strftime('%m%d%H%M%S')}-{next(self._ids)}"
         self.doc = doc
+        self.printer = printer.id
+        self.dpi = printer.paper.dpi
         self.source = source
         self.title = title
         self.created = time.time()
@@ -74,8 +77,8 @@ class Job:
         return {
             "id": self.id, "title": self.title, "source": self.source, "created": self.created,
             "status": self.status, "error": self.error, "progress": round(self.progress, 3),
-            "height": self.height, "length_mm": round(self.height * 25.4 / protocol.DPI),
-            "copies": self.copies, "darkness": self.darkness,
+            "height": self.height, "length_mm": round(self.height * 25.4 / self.dpi), "dpi": self.dpi,
+            "printer": self.printer, "copies": self.copies, "darkness": self.darkness,
             "preview": f"/api/jobs/{self.id}.png",
         }
 
@@ -111,22 +114,32 @@ class PrintService:
     PREVIEWS_KEPT = 48         # rendered camera-photo previews (PNG bytes, ~10-30 KB each)
     RETRY_EVERY = 20.0         # seconds between tries while a print waits for the printer
 
-    def __init__(self, printer: Printer, cfg: dict):
-        self.printer = printer
+    def __init__(self, printer, cfg: dict):
+        """printer: one Printer, or a list of them (the first is the main one: prints that don't say go there)."""
+        chain = list(printer) if isinstance(printer, (list, tuple)) else [printer]
+        if not chain:
+            raise ValueError("no printer")
+        self.printers: dict[str, Printer] = {}
+        for p in chain:
+            if p.id in self.printers:
+                raise ValueError(f"two printers are called {p.id}")
+            self.printers[p.id] = p
+        self.printer = chain[0]
         self.cfg = cfg
+        self.SETTINGS = dict(self.SETTINGS, camera_printer=("", *self.printers))
         self.jobs_dir = os.path.join(cfg["data_dir"], "jobs")
         os.makedirs(self.jobs_dir, exist_ok=True)
         # history is shared by the HTTP threads and the print worker: always under _lock
         self._lock = threading.Lock()
         self.history: collections.OrderedDict[str, Job] = collections.OrderedDict()
-        self.queue: queue.Queue[Job] = queue.Queue()
+        self.queues: dict[str, queue.Queue[Job]] = {pid: queue.Queue() for pid in self.printers}
         self.started = time.time()
         self.camera = camera.CameraGallery(cfg["data_dir"], cfg.get("camera_stuck_pixel"))
         self._previews: collections.OrderedDict = collections.OrderedDict()
         self._drawing: dict = {}       # preview key -> Event, while it's being drawn
         self._predraw: queue.Queue[str] = queue.Queue()
         self._last_preview = 0.0       # when someone last asked for a preview (background drawing waits)
-        self._trouble: str | None = None   # while prints wait for the printer: the alert sent about it
+        self._trouble: dict[str, str | None] = {}   # printer id -> while prints wait for it: the alert sent
         self.offload = offload.Offload()   # heavy jobs go to the desktop PC while its helper runs
         self._ready_prints: collections.OrderedDict = collections.OrderedDict()
         self._sharpened: collections.OrderedDict = collections.OrderedDict()
@@ -134,7 +147,8 @@ class PrintService:
         ai.REMOTE = self._remote_drawing
         render.SHARPEN = self._remote_sharpen
         self._load_history()
-        threading.Thread(target=self._worker, name="printer", daemon=True).start()
+        for pid in self.printers:
+            threading.Thread(target=self._worker, args=(pid,), name=f"printer-{pid}", daemon=True).start()
         threading.Thread(target=self._warm_up, name="warm-up", daemon=True).start()
 
     def _remote_drawing(self, name: str, picture: Image.Image) -> Image.Image | None:
@@ -211,21 +225,40 @@ class PrintService:
 
     # ------------------------------------------------------------ jobs
 
+    def pick(self, printer_id=None) -> Printer:
+        """The printer with that id (or label), the main one for none; ValueError for one that isn't set up."""
+        if printer_id in (None, ""):
+            return self.printer
+        wanted = str(printer_id).strip().lower()
+        for p in self.printers.values():
+            if wanted in (p.id, p.label.lower()):
+                return p
+        raise ValueError(f"no printer called {printer_id} (set up: {', '.join(self.printers)})")
+
+    def default_feed(self, printer: Printer) -> int:
+        """The settings' "feed" is the main CTP500's; other printers have their own."""
+        if printer is self.printer and printer.model.key == "ctp500":
+            return int(self.cfg.get("feed", 2))
+        return int(printer.default_feed)
+
     def submit(self, doc, source: str = "api", render_now: bool = True) -> Job:
         """Queue a print. render_now=False draws it in the print worker instead (camera prints: the camera
         shouldn't wait ~3 s for an AI drawing it never sees); render errors then fail the job."""
-        doc = render.with_defaults(render.normalize(doc), self.cfg)
-        job = Job(doc, source, _title(doc))
+        doc = render.normalize(doc)
+        printer = self.pick(doc.get("printer"))
+        doc = render.with_defaults(doc, self.cfg, printer.paper)   # the darkness can depend on the printer
+        doc["printer"] = printer.id         # reprints go to the same printer
+        job = Job(doc, source, _title(doc), printer)
         if job.darkness is None:
             job.darkness = self.cfg.get("darkness")
         if "feed" not in doc:
-            job.feed = int(self.cfg.get("feed", 2))
+            job.feed = self.default_feed(printer)
         if render_now:
-            self._attach_image(job, render.render(doc))
+            self._attach_image(job, render.render(doc, paper=printer.paper))
         with self._lock:
             self.history[job.id] = job
             self._trim_history()
-        self.queue.put(job)
+        self.queues[printer.id].put(job)
         return job
 
     def _attach_image(self, job: Job, image) -> None:
@@ -233,7 +266,8 @@ class PrintService:
         job.height = image.height
         image.save(os.path.join(self.jobs_dir, f"{job.id}.png"))
 
-    def reprint(self, job_id: str, source: str = "reprint") -> Job:
+    def reprint(self, job_id: str, source: str = "reprint", printer_id: str | None = None) -> Job:
+        """Print a job again, on the printer it went to unless printer_id names another."""
         old = self.job(job_id)
         if old is None:
             raise KeyError(job_id)
@@ -242,6 +276,11 @@ class PrintService:
             path = os.path.join(self.jobs_dir, f"{job_id}.json")
             with open(path, encoding="utf-8") as f:
                 doc = json.load(f)
+        doc = dict(doc)
+        if printer_id:
+            doc["printer"] = printer_id
+        elif doc.get("printer") not in self.printers:
+            doc.pop("printer", None)        # that printer was removed: the main one
         return self.submit(doc, source)
 
     def job(self, job_id: str) -> Job | None:
@@ -259,9 +298,9 @@ class PrintService:
         job.cancel.set()
         return job
 
-    def _worker(self) -> None:
+    def _worker(self, printer_id: str) -> None:
         while True:
-            job = self.queue.get()
+            job = self.queues[printer_id].get()
             try:
                 self._run(job)
             except Exception:  # never let anything stop the queue
@@ -275,9 +314,10 @@ class PrintService:
         if job.cancel.is_set():
             job.status = "cancelled"
             return
+        printer = self.printers[job.printer]
         if job.image is None:
             try:
-                self._attach_image(job, render.render(job.doc))
+                self._attach_image(job, render.render(job.doc, paper=printer.paper))
             except (render.RenderError, ValueError, OSError) as exc:
                 job.status, job.error = "failed", f"couldn't draw it: {exc}"
                 return
@@ -291,9 +331,9 @@ class PrintService:
             if job.status != "waiting":      # a retry stays "waiting" until the printer takes data
                 job.status = "printing"
             try:
-                self.printer.print_image(job.image, job.darkness, job.feed, job.copies, job.cancel, sending)
+                printer.print_image(job.image, job.darkness, job.feed, job.copies, job.cancel, sending)
                 job.status, job.progress, job.error = "done", 1.0, None
-                self._printer_ok()
+                self._printer_ok(printer)
                 return
             except Cancelled:
                 break
@@ -301,48 +341,50 @@ class PrintService:
                 job.error, job.progress = str(exc), 0.0
                 if time.time() + self.RETRY_EVERY > give_up:
                     job.status = "failed"
-                    self._printer_gave_up(exc)
+                    self._printer_gave_up(printer, exc)
                     return
                 job.status = "waiting"
-                self._printer_trouble(exc)
+                self._printer_trouble(printer, exc)
                 job.cancel.wait(self.RETRY_EVERY)
             except Exception as exc:  # never let one bad job stop the queue
                 job.status, job.error = "failed", f"{type(exc).__name__}: {exc}"
                 traceback.print_exc()
                 return
         job.status = "cancelled"
-        if self.queue.empty():
+        if self.queues[printer.id].empty():
             with self._lock:
-                self._trouble = None    # nothing waits any more: the next problem is news again
+                self._trouble[printer.id] = None    # nothing waits any more: the next problem is news again
 
     # ------------------------------------------------------------ printer trouble -> phone
 
-    def _problem(self, exc: TransportError) -> tuple[str, str]:
+    def _problem(self, printer: Printer, exc: TransportError) -> tuple[str, str]:
+        who = "Printer" if len(self.printers) == 1 else printer.label
         if isinstance(exc, PrinterNotReady):
-            return "Printer: " + " and ".join(catproto.PROBLEM_TEXT.get(p, p) for p in exc.problems), ""
-        return "Printer: can't reach it", "Is it switched on? "
+            return f"{who}: {exc.text()}", ""
+        return f"{who}: can't reach it", "Is it switched on? "
 
-    def _printer_trouble(self, exc: TransportError) -> None:
-        title, hint = self._problem(exc)
+    def _printer_trouble(self, printer: Printer, exc: TransportError) -> None:
+        title, hint = self._problem(printer, exc)
         with self._lock:
-            if self._trouble is not None:
+            if self._trouble.get(printer.id) is not None:
                 return
-            self._trouble = title
+            self._trouble[printer.id] = title
         minutes = round(float(self.cfg.get("retry_minutes", 30)))
         self._notify(title, f"{hint}Waiting prints go out once it's fixed (for up to {minutes} minutes).")
 
-    def _printer_ok(self) -> None:
+    def _printer_ok(self, printer: Printer) -> None:
         with self._lock:
-            was, self._trouble = self._trouble, None
+            was, self._trouble[printer.id] = self._trouble.get(printer.id), None
         if was:
-            self._notify("Printer: printed after all", "The waiting prints went out.")
+            who = "Printer" if len(self.printers) == 1 else printer.label
+            self._notify(f"{who}: printed after all", "The waiting prints went out.")
 
-    def _printer_gave_up(self, exc: TransportError) -> None:
-        if not self.queue.empty():
+    def _printer_gave_up(self, printer: Printer, exc: TransportError) -> None:
+        if not self.queues[printer.id].empty():
             return                  # the next print is still trying
         with self._lock:
-            was, self._trouble = self._trouble, None
-        title, hint = self._problem(exc)
+            was, self._trouble[printer.id] = self._trouble.get(printer.id), None
+        title, hint = self._problem(printer, exc)
         self._notify(title, (f"{hint}Gave up on the waiting prints; " if was else f"{hint}The print failed; ")
                      + "reprint from History in the web app.")
 
@@ -389,6 +431,7 @@ class PrintService:
                 "created": entry.get("created", 0), "status": entry.get("status", "done"),
                 "error": entry.get("error"), "progress": entry.get("progress", 1.0),
                 "height": entry.get("height", 0), "copies": entry.get("copies", 1),
+                "printer": entry.get("printer") or self.printer.id, "dpi": entry.get("dpi", protocol.DPI),
                 "darkness": entry.get("darkness"), "feed": 4, "image": None,
                 "cancel": threading.Event(), "finished": threading.Event(),
             })
@@ -412,12 +455,14 @@ class PrintService:
         pending = [j.as_dict() for j in self.jobs() if j.status in ("queued", "printing", "waiting")]
         return {
             "version": __version__,
-            "printer": self.printer.snapshot(),
+            "printer": self.printer.snapshot(),          # the main one (as before there were several)
+            "printers": [p.snapshot() for p in self.printers.values()],
+            "camera_printer": self.camera_printer().id,
             "queue": pending,
             "defaults": {"darkness": self.cfg.get("darkness"), "feed": self.cfg.get("feed")},
             "darkness_presets": protocol.DARKNESS_PRESETS,
-            "width": protocol.WIDTH,
-            "dpi": protocol.DPI,
+            "width": self.printer.paper.width,
+            "dpi": self.printer.paper.dpi,
             "auth": bool(self.cfg.get("token")),
             "uptime": round(time.time() - self.started),
             "helper": self.offload.status(),
@@ -480,19 +525,33 @@ class PrintService:
 
     # ------------------------------------------------------------ camera
 
+    def camera_printer(self, overrides: dict | None = None) -> Printer:
+        """Where a camera print goes: the override, else the camera_printer setting, else the main printer."""
+        wanted = (overrides or {}).get("printer")
+        if wanted:
+            return self.pick(wanted)
+        try:
+            return self.pick(self.cfg.get("camera_printer") or None)
+        except ValueError:                  # the setting names a printer that was removed
+            return self.printer
+
     def camera_print(self, name: str, overrides: dict | None = None, source: str = "camera") -> Job:
         """Drawn by the print worker: the caller (the camera, the Photos page) gets its answer at once."""
-        return self.submit(camera.print_doc(self.camera.read(name), name, self.cfg, overrides), source,
-                           render_now=False)
+        doc = camera.print_doc(self.camera.read(name), name, self.cfg, overrides)
+        doc["printer"] = self.camera_printer(overrides).id
+        return self.submit(doc, source, render_now=False)
 
-    def camera_preview(self, name: str, overrides: dict | None = None, background: bool = False) -> tuple[bytes, int]:
-        """(PNG, height in dots) of how a photo prints. Kept in a small cache, so flipping back to a photo or a
+    def camera_preview(self, name: str, overrides: dict | None = None,
+                       background: bool = False) -> tuple[bytes, int, int]:
+        """(PNG, height in dots, dpi) of how a photo prints. Kept in a small cache, so flipping back to a photo or a
         setting shows at once instead of being redrawn (an AI drawing is ~3 s on the Pi)."""
         if not background:
             self._last_preview = time.monotonic()
+        printer = self.camera_printer(overrides)
         data = self.camera.read(name)
-        doc = render.with_defaults(camera.print_doc(data, name, self.cfg, overrides), self.cfg)
+        doc = render.with_defaults(camera.print_doc(data, name, self.cfg, overrides), self.cfg, printer.paper)
         shape = {k: v for k, v in doc["blocks"][0].items() if k != "data"}
+        shape["printer"] = printer.id   # in the cache key: each printer has its own paper
         # placeholders expanded, so a {time} caption isn't served stale
         key = (name, len(data), render.expand(json.dumps([shape, doc.get("padding_top_mm"), doc.get("padding_bottom_mm"),
                                                            doc.get("darkness"), doc.get("photo_look")],
@@ -509,10 +568,10 @@ class PrintService:
                     break
             busy.wait(60)                   # the same preview is being drawn (a prefetch): share it
         try:
-            image = render.render(doc)
+            image = render.render(doc, paper=printer.paper)
             buf = io.BytesIO()
             image.save(buf, "PNG")
-            out = (buf.getvalue(), image.height)
+            out = (buf.getvalue(), image.height, printer.paper.dpi)
             with self._lock:
                 self._previews[key] = out
                 while len(self._previews) > self.PREVIEWS_KEPT:
@@ -545,7 +604,7 @@ class PrintService:
 
 def _options_from_query(query: dict) -> dict:
     out = {}
-    for key in ("darkness", "copies", "feed"):
+    for key in ("darkness", "copies", "feed", "printer"):
         if key in query:
             out[key] = query[key]
     return out
@@ -830,12 +889,16 @@ class Handler(BaseHTTPRequestHandler):
             doc.update(_options_from_query(query))
             return self._queued(svc.submit(doc, source), query)
         if path == "/api/preview":
-            image = render.render(render.with_defaults(render.normalize(self._json_body()), svc.cfg))
+            doc = render.normalize(self._json_body())
+            printer = svc.pick(query.get("printer") or doc.get("printer"))
+            doc = render.with_defaults(doc, svc.cfg, printer.paper)
+            image = render.render(doc, paper=printer.paper)
             buf = io.BytesIO()
             image.save(buf, "PNG")
             return self._send(200, buf.getvalue(), "image/png", {
                 "X-Print-Height": str(image.height),
-                "X-Print-Length-Mm": str(round(image.height * 25.4 / protocol.DPI)),
+                "X-Print-Length-Mm": str(printer.paper.mm(image.height)),
+                "X-Printer": printer.id,
             })
         if path == "/api/settings":
             return self._json(200, svc.update_settings(self._json_body()))
@@ -856,9 +919,9 @@ class Handler(BaseHTTPRequestHandler):
             overrides = {k: v for k, v in {**query, **(body if isinstance(body, dict) else {})}.items()
                          if k in CAMERA_OVERRIDES}
             if path.endswith("/preview"):   # what the paper would look like, without printing
-                png, height = svc.camera_preview(name, overrides)
+                png, height, dpi = svc.camera_preview(name, overrides)
                 return self._send(200, png, "image/png", {
-                    "X-Print-Length-Mm": str(round(height * 25.4 / protocol.DPI))})
+                    "X-Print-Length-Mm": str(round(height * 25.4 / dpi))})
             return self._queued(svc.camera_print(name, overrides, source), query)
         if path.startswith("/api/helper/result/"):   # the PC helper's answer to a job
             meta = json.loads(self.headers.get("X-Job-Meta") or "{}")
@@ -866,15 +929,17 @@ class Handler(BaseHTTPRequestHandler):
                                        self.headers.get("X-Job-Error"))
             return self._json(200, {"taken": taken})
         if path == "/api/feed":
-            svc.printer.feed(int(query.get("lines", 3)))
+            svc.pick(query.get("printer")).feed(int(query.get("lines", 3)))
             return self._json(200, {"ok": True})
         if path == "/api/check":
-            return self._json(200, {"status": svc.printer.check(), "printer": svc.printer.snapshot()})
+            printer = svc.pick(query.get("printer"))
+            return self._json(200, {"status": printer.check(), "printer": printer.snapshot()})
         if path == "/api/disconnect":
-            svc.printer.disconnect()
-            return self._json(200, {"printer": svc.printer.snapshot()})
+            printer = svc.pick(query.get("printer"))
+            printer.disconnect()
+            return self._json(200, {"printer": printer.snapshot()})
         if path.startswith("/api/jobs/") and path.endswith("/reprint"):
-            return self._queued(svc.reprint(path.split("/")[3], "reprint"), query)
+            return self._queued(svc.reprint(path.split("/")[3], "reprint", query.get("printer")), query)
         if path.startswith("/api/jobs/") and path.endswith("/cancel"):
             return self._json(200, {"job": svc.cancel(path.split("/")[3]).as_dict()})
         return self._error(404, "unknown API call")
@@ -911,8 +976,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, f.read(), ctype, extra)
 
 
-def serve(printer: Printer, cfg: dict, quiet: bool = False) -> ThreadingHTTPServer:
-    """Start the server (call serve_forever() on the result)."""
+def serve(printer, cfg: dict, quiet: bool = False) -> ThreadingHTTPServer:
+    """Start the server (call serve_forever() on the result). printer: one Printer or a list, main first."""
     service = PrintService(printer, cfg)
     handler = type("BoundHandler", (Handler,), {"service": service, "quiet": quiet})
     httpd = ThreadingHTTPServer((cfg.get("host", "0.0.0.0"), int(cfg.get("port", 8500))), handler)

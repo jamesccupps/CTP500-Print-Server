@@ -36,9 +36,10 @@ def wants_rgb(style: str) -> bool:
 
 
 def apply_rgb(rgb: Image.Image, style: str, width: int, detail: float = 0.5, weight: int = 2,
-              level: int = 3, look: str = "punchy") -> Image.Image:
+              level: int = 3, look: str = "punchy", scale: float = 1.0) -> Image.Image:
     if style in PHOTO_STYLES:
-        return thermal_photo(rgb, width, detail, weight, outlines=(style == "photoline"), level=level, look=look)
+        return thermal_photo(rgb, width, detail, weight, outlines=(style == "photoline"), level=level, look=look,
+                             scale=scale)
     return apply_ai(rgb, style, width, detail, weight)
 
 
@@ -82,7 +83,7 @@ def tone_curve(level: int = 2, lift: float = 1.0) -> tuple[int, ...]:
 
 
 def thermal_photo(rgb: Image.Image, width: int, detail: float = 0.5, weight: int = 2,
-                  outlines: bool = False, level: int = 3, look: str = "punchy") -> Image.Image:
+                  outlines: bool = False, level: int = 3, look: str = "punchy", scale: float = 1.0) -> Image.Image:
     """A photo prepared for thermal paper, which plain dithering prints gray and muddy (2026-10-30, MEMENTO camera shots):
     calm the sensor grain, dehaze as much as the picture needs, stretch contrast, size it, sharpen (detail sets
     how much), set the tones, then Atkinson dithering, which keeps light areas clean. With outlines, a thin AI
@@ -92,32 +93,60 @@ def thermal_photo(rgb: Image.Image, width: int, detail: float = 0.5, weight: int
     look "punchy" (the default): a midtone lift (gamma 0.8, 0.7 under outlines), printed at normal. Light skin goes
     to bare paper and deep shadows to black, but it beat "even" in an A/B print (2026-10-30), above
     all for dim shots. look "even": the measured tone_curve for this darkness level, printed at light: more gray
-    steps, flatter."""
+    steps, flatter.
+
+    scale: dots per CTP500 dot (printers.Paper.scale), for the sharpening radius and the smallest outline kept,
+    which were tuned in CTP500 dots. The tones were measured on the CTP500 only.
+
+    Finer dots (scale >= printers.FINE_SCALE: the M02 Pro's 300 dpi) print alone weakly, show a camera's grain
+    that the CTP500's spreading dots hide, and print lighter, so there (picked on paper, 2026-11-11): a median
+    filter on the picture first, sharpening that leaves small changes (grain) alone, a smaller midtone lift,
+    and raster.clustered_atkinson (and the photos print at darkest: render.with_defaults)."""
     from . import ai
+    from .printers import FINE_SCALE
     detail = min(1.0, max(0.0, float(detail)))
     weight = min(3, max(1, int(weight)))
     width = max(16, int(width))
+    fine = scale >= FINE_SCALE
     work = rgb.convert("RGB").filter(ImageFilter.GaussianBlur(max(0.3, rgb.width / 1600)))
+    if fine:
+        work = work.filter(ImageFilter.MedianFilter(FINE_MEDIAN))
     work = ai.local_contrast(work, min(0.55, ai.dehaze_strength(work)))
     gray = ImageOps.autocontrast(work.convert("L"), cutoff=1)
     if FACE_TONES:
         gray = _face_tones(gray, rgb)
     gray = gray.resize((width, max(1, round(gray.height * width / gray.width))), Image.LANCZOS)
-    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.6, percent=round(60 + 100 * detail), threshold=2))
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.6 * scale, percent=round(60 + 100 * detail),
+                                               threshold=FINE_SHARPEN_THRESHOLD if fine else 2))
     if look == "even":
         gray = gray.point(list(tone_curve(level, 0.9 if outlines else 1.0)))
     else:
         gamma = 0.7 if outlines else 0.8
+        if fine:
+            gamma += FINE_DARKER
         gray = gray.point([round(255 * (i / 255) ** gamma) for i in range(256)])
-    from .raster import to_1bit
-    ink = np.asarray(to_1bit(gray, "atkinson").convert("L")) < 128
+    from .raster import clustered_atkinson, to_1bit
+    bw = clustered_atkinson(gray, FINE_CLUMPS) if fine else to_1bit(gray, "atkinson")
+    ink = np.asarray(bw.convert("L")) < 128
     if outlines and ai.available("lineart"):
         drawing = ai.draw(rgb, "lineart", max(256, round(width * 1.67)))
         tones = np.asarray(drawing.resize((width, ink.shape[0]), Image.LANCZOS))
         share = {1: 0.05, 2: 0.08, 3: 0.11}[weight]
-        lines = _remove_specks(tones < float(min(200, np.quantile(tones, share))), 8)
+        lines = _remove_specks(tones < float(min(200, np.quantile(tones, share))), round(8 * scale * scale))
         ink = ink | lines
     return _to_1bit(ink)
+
+
+# Photos on finer dots than the CTP500's (see thermal_photo). A/B strips on the M02 Pro, 2026-11-11, a dim camera
+# shot + a phone portrait: plain Atkinson blotchy and grainy; median 5 + threshold 8 calmer; 2x2 dots solid but
+# lost the detail; clustered dots kept it and looked best (clumps 0.6 over 0.35). They printed lighter than the
+# CTP500 (same paper in both): measured from photos of both printers' strips, the CTP500's own setting looked 49%
+# dark; the M02 Pro at normal 36% (lift 0.7) / 43% (0.85) / 44% (1.0), at darkest 45% (0.7) / 50% (0.85). So
+# 0.15 less lift (0.85 with outlines, 0.95 without: that one not printed) + darkest.
+FINE_MEDIAN = 5             # median filter on the picture (pixels), against the camera's grain
+FINE_SHARPEN_THRESHOLD = 8  # levels: smaller changes (grain) aren't sharpened (the CTP500's is 2)
+FINE_CLUMPS = 0.6
+FINE_DARKER = 0.15          # added to the midtone gamma (less lift: darker middle tones)
 
 
 # Tones set for the faces rather than the whole room (2026-10-31): after the stretch, the faces of the 55 test
@@ -193,11 +222,15 @@ NO_DITHER = getattr(Image, "Dither", Image).NONE
 FLOYD = getattr(Image, "Dither", Image).FLOYDSTEINBERG
 
 
-def apply(gray: Image.Image, style: str, detail: float = 0.5, weight: int = 2) -> Image.Image:
+def apply(gray: Image.Image, style: str, detail: float = 0.5, weight: int = 2, scale: float = 1.0) -> Image.Image:
+    """scale (dots per CTP500 dot) only matters to sketch: the drawn styles are drawn at the CTP500's size
+    (raster.render_picture)."""
     detail = min(1.0, max(0.0, float(detail)))
     weight = min(3, max(1, int(weight)))
     if style in PHOTO_STYLES:   # normally routed through apply_rgb; this is only a safety net
-        return thermal_photo(gray.convert("RGB"), gray.width, detail, weight, outlines=False)
+        return thermal_photo(gray.convert("RGB"), gray.width, detail, weight, outlines=False, scale=scale)
+    if style == "sketch":
+        return sketch(gray.convert("L"), detail, weight, scale)
     fn = {"line": line, "artist": line, "sketch": sketch, "coloring": coloring, "poster": poster,
           "halftone": halftone, "hatch": hatch}[style]
     return fn(gray.convert("L"), detail, weight)
@@ -312,11 +345,11 @@ def coloring(gray: Image.Image, detail: float, weight: int) -> Image.Image:
     return _to_1bit(_thicken(ink, weight + 1))
 
 
-def sketch(gray: Image.Image, detail: float, weight: int) -> Image.Image:
+def sketch(gray: Image.Image, detail: float, weight: int, scale: float = 1.0) -> Image.Image:
     """Soft pencil: the 'color dodge' trick, then fine grain like graphite on paper."""
     gray = _prepare(gray, 1)
     g = _f(gray)
-    inv_blur = 1.0 - _blur(gray, _lerp(10.0, 3.0, detail))
+    inv_blur = 1.0 - _blur(gray, _lerp(10.0, 3.0, detail) * scale)
     dodge = np.clip(g / np.maximum(1.0 - inv_blur, 1e-3), 0.0, 1.0)
     tone = dodge ** _lerp(1.6, 2.6, (weight - 1) / 2)            # darker strokes for heavier weight
     tone = 0.85 * tone + 0.15 * np.clip(g * 1.3, 0, 1)         # keep a little of the shading

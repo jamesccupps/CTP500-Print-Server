@@ -1,4 +1,4 @@
-"""Laying out a print from blocks (text, images, QR codes, lists...) into one 384-dot-wide picture.
+"""Laying out a print from blocks (text, images, QR codes, lists...) into one paper-wide picture.
 
 A document is a dict:
 
@@ -7,7 +7,9 @@ A document is a dict:
                 {"type": "line"}],
      "margin": 6, "gap": 6}
 
-Block types and their options are listed in BLOCK_TYPES; see README.md for the full reference.
+Block types and their options are listed in BLOCK_TYPES; see README.md for the full reference. Sizes are in
+CTP500 dots (1/8 mm); for a printer with finer dots (printers.Paper) everything is drawn scaled up, so a print
+is the same size on any printer.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import re
 from PIL import Image, ImageDraw, ImageOps
 
 from . import catproto, fonts, raster
-from .protocol import WIDTH
+from .printers import DEFAULT_PAPER, LAYOUT_WIDTH, Paper
 
 NEAREST = getattr(Image, "Resampling", Image).NEAREST
 ROTATE_270 = getattr(Image, "Transpose", Image).ROTATE_270
@@ -64,10 +66,20 @@ def expand(text: str, now: _dt.datetime | None = None) -> str:
 
 # ---------------------------------------------------------------- text helpers
 
-def _font(block: dict, size: int | None = None, bold: bool | None = None):
+def _d(ctx: dict, value) -> int:
+    """A size in layout dots -> dots on this paper (at least 1)."""
+    return max(1, round(float(value) * ctx["s"]))
+
+
+def _z(ctx: dict, value) -> int:
+    """Like _d, but 0 stays 0."""
+    return max(0, round(float(value) * ctx["s"]))
+
+
+def _font(block: dict, ctx: dict, size: int | None = None, bold: bool | None = None):
     family = str(block.get("font") or "sans")
-    return fonts.load(family, int(size or block.get("size") or DEFAULT_SIZE),
-                      bool(block.get("bold") if bold is None else bold))
+    size = min(400, int(size or block.get("size") or DEFAULT_SIZE))      # 400 on the CTP500, as before
+    return fonts.load(family, _d(ctx, size), bool(block.get("bold") if bold is None else bold))
 
 
 def _px(font) -> int:
@@ -125,26 +137,26 @@ def _draw_lines(draw: ImageDraw.ImageDraw, lines: list[str], font, fake_bold: bo
         draw.text((x, y0 + i * line_h), line, font=font, fill=fill, stroke_width=stroke, stroke_fill=fill)
 
 
-def _strip(height: int, color: int = PAPER) -> Image.Image:
-    return Image.new("L", (WIDTH, max(1, int(height))), color)
+def _strip(ctx: dict, height: int, color: int = PAPER) -> Image.Image:
+    return Image.new("L", (ctx["W"], max(1, int(height))), color)
 
 
 # ---------------------------------------------------------------- blocks
 
 def _text(block: dict, ctx: dict) -> Image.Image:
     text = expand(str(block.get("text", "")), ctx["now"])
-    font, fake_bold = _font(block)
+    font, fake_bold = _font(block, ctx)
     margin = ctx["margin"]
     invert = bool(block.get("invert"))
-    pad = int(block.get("padding", 6 if invert else 0))
-    width = WIDTH - 2 * margin - 2 * pad
+    pad = _z(ctx, int(block.get("padding", 6 if invert else 0)))
+    width = ctx["W"] - 2 * margin - 2 * pad
     lines = wrap(text, font, width)
     line_h = _line_height(font, float(block.get("spacing", 1.15)))
-    img = _strip(len(lines) * line_h + 2 * pad, INK if invert else PAPER)
+    img = _strip(ctx, len(lines) * line_h + 2 * pad, INK if invert else PAPER)
     _draw_lines(ImageDraw.Draw(img), lines, font, fake_bold, margin + pad, pad, width,
                 str(block.get("align", "left")), line_h, PAPER if invert else INK)
     if block.get("underline"):
-        img = _stack([img, _strip(2, INK)], gap=1)
+        img = _stack(ctx, [img, _strip(ctx, _d(ctx, 2), INK)], gap=_d(ctx, 1))
     return img
 
 
@@ -193,17 +205,21 @@ def _image(block: dict, ctx: dict) -> Image.Image:
     if mode not in raster.PICTURE_MODES:
         raise RenderError(f"unknown style '{mode}' (known: {', '.join(raster.PICTURE_MODES)})")
     img = _decode_image(block, ctx)
-    if img.format == "JPEG" and max(img.size) > 2048:
+    photo = img.format == "JPEG"
+    if photo and max(img.size) > 2048:
         # phone photos are ~12 MP; decode at 1/2 or 1/4 scale straight from the JPEG (much faster on the Pi)
         img.draft("RGB", (img.width * 1600 // max(img.size), img.height * 1600 // max(img.size)))
     img = ImageOps.exif_transpose(img)
     img.load()
+    if photo:       # a camera's column streaks print as lines (sideways prints, above all on the M02 Pro)
+        from .camera import destripe
+        img = destripe(img)
     if block.get("sharpen_faces") and SHARPEN is not None:
         img = SHARPEN(img) or img
     if block.get("zoom_faces"):
         img = _zoom_faces(img)
     framed = bool(block.get("frame"))
-    border, pad = 3, 8                     # instant-photo frame: line width, gap around the picture
+    border, pad = _d(ctx, 3), _d(ctx, 8)   # instant-photo frame: line width, gap around the picture
     rotate = int(block.get("rotate", 0))
     options = dict(
         dither=mode,
@@ -217,16 +233,17 @@ def _image(block: dict, ctx: dict) -> Image.Image:
         weight=int(block.get("weight", 2)),
         level=ctx["level"],
         look=ctx["look"],
+        scale=ctx["s"],
     )
     w, h = (img.height, img.width) if rotate % 180 == 90 else img.size
     try:
         if block.get("sideways") and w > h:
             return _sideways(img, w / h, options, framed, str(block.get("caption", "")), ctx, border, pad)
-        width = int(block.get("width", WIDTH))
+        width = min(ctx["W"], _d(ctx, int(block.get("width", LAYOUT_WIDTH))))
         if framed:
-            width = min(width, WIDTH - 2 * (ctx["margin"] + border + pad))
+            width = min(width, ctx["W"] - 2 * (ctx["margin"] + border + pad))
         bw = raster.prepare_image(img, width=width, align="center" if framed else str(block.get("align", "center")),
-                                  **options)
+                                  paper_width=ctx["W"], **options)
     except ImportError:
         raise RenderError(f"the '{mode}' style needs numpy (pip install numpy, or apt install python3-numpy)") from None
     if framed:
@@ -249,26 +266,26 @@ def _sideways(img: Image.Image, aspect: float, options: dict, framed: bool, capt
     """A landscape picture printed along the paper, as big as the paper's width allows (turn the strip to look
     at it, like a banner): laid out landscape, frame and caption included, then turned. ~1.4x the area of an
     upright framed print, ~2x without the frame."""
-    margin = ctx["margin"]
-    font, fake_bold = fonts.load("sans", 24, False)
+    margin, W = ctx["margin"], ctx["W"]
+    font, fake_bold = fonts.load("sans", _d(ctx, 24), False)
     line_h = _line_height(font, 1.1)
     caption = expand(caption, ctx["now"]).strip() if framed else ""
     if framed:
-        bottom = 44 if not caption else line_h + 2 * pad + 6
-        ph = WIDTH - 2 * margin - border - 2 * pad - bottom
+        bottom = _d(ctx, 44) if not caption else line_h + 2 * pad + _d(ctx, 6)
+        ph = W - 2 * margin - border - 2 * pad - bottom
     else:
-        bottom, ph = 0, WIDTH - 2 * margin
+        bottom, ph = 0, W - 2 * margin
     pw = max(8, round(ph * aspect))
     picture = raster.render_picture(img, pw, **options).convert("L")
     if picture.height != ph:  # rounding: make it exactly fill its slot
         picture = picture.resize((pw, ph), NEAREST)
     inset = border + pad if framed else 0
-    canvas = Image.new("L", (pw + 2 * inset, WIDTH), PAPER)
+    canvas = Image.new("L", (pw + 2 * inset, W), PAPER)
     canvas.paste(picture, (inset, margin + inset))
     if framed:
         draw = ImageDraw.Draw(canvas)
         for i in range(border):
-            draw.rectangle([i, margin + i, canvas.width - 1 - i, WIDTH - 1 - margin - i], outline=INK)
+            draw.rectangle([i, margin + i, canvas.width - 1 - i, W - 1 - margin - i], outline=INK)
         if caption:
             lines = wrap(caption, font, canvas.width - 2 * inset)[:1]
             top = margin + inset + ph + pad + (bottom - border - line_h) // 2
@@ -278,16 +295,17 @@ def _sideways(img: Image.Image, aspect: float, options: dict, framed: bool, capt
 
 def _frame(strip: Image.Image, width: int, caption: str, ctx: dict, border: int, pad: int) -> Image.Image:
     """An instant-photo frame around a picture: a thin border, and a deeper bottom with the caption."""
-    left = (WIDTH - width) // 2
+    W = ctx["W"]
+    left = (W - width) // 2
     picture = strip.crop((left, 0, left + width, strip.height))
-    x0, x1 = ctx["margin"], WIDTH - ctx["margin"] - 1
+    x0, x1 = ctx["margin"], W - ctx["margin"] - 1
     caption = expand(caption, ctx["now"]).strip()
-    font, fake_bold = fonts.load("sans", 24, False)
+    font, fake_bold = fonts.load("sans", _d(ctx, 24), False)
     lines = wrap(caption, font, x1 - x0 - 2 * (border + pad)) if caption else []
     line_h = _line_height(font, 1.1)
-    bottom = max(44, len(lines) * line_h + 2 * pad + 6)
-    out = _strip(border + pad + picture.height + pad + bottom)
-    out.paste(picture, ((WIDTH - width) // 2, border + pad))
+    bottom = max(_d(ctx, 44), len(lines) * line_h + 2 * pad + _d(ctx, 6))
+    out = _strip(ctx, border + pad + picture.height + pad + bottom)
+    out.paste(picture, ((W - width) // 2, border + pad))
     draw = ImageDraw.Draw(out)
     for i in range(border):
         draw.rectangle([x0 + i, i, x1 - i, out.height - 1 - i], outline=INK)
@@ -317,34 +335,35 @@ def _qr(block: dict, ctx: dict) -> Image.Image:
     matrix = qr_matrix(data, str(block.get("level", "M")))
     n = len(matrix)
     quiet = 2
-    box = max(1, int(block.get("size", 240)) // (n + 2 * quiet))
-    box = min(box, (WIDTH - 2 * ctx["margin"]) // (n + 2 * quiet)) or 1
+    W = ctx["W"]
+    box = max(1, _d(ctx, int(block.get("size", 240))) // (n + 2 * quiet))
+    box = min(box, (W - 2 * ctx["margin"]) // (n + 2 * quiet)) or 1
     code = Image.new("L", (n, n), PAPER)
     code.putdata([INK if cell else PAPER for row in matrix for cell in row])
     side = n * box
     code = code.resize((side, side), NEAREST)
-    img = _strip(side + 2 * quiet * box)
+    img = _strip(ctx, side + 2 * quiet * box)
     align = str(block.get("align", "center"))
-    x = {"left": ctx["margin"], "right": WIDTH - ctx["margin"] - side}.get(align, (WIDTH - side) // 2)
+    x = {"left": ctx["margin"], "right": W - ctx["margin"] - side}.get(align, (W - side) // 2)
     img.paste(code, (x, quiet * box))
     caption = block.get("caption")
     if caption:
         cap = _text({"text": caption, "size": block.get("caption_size", 20), "align": "center"}, ctx)
-        img = _stack([img, cap], gap=0)
+        img = _stack(ctx, [img, cap], gap=0)
     return img
 
 
 def _line(block: dict, ctx: dict) -> Image.Image:
-    thick = max(1, int(block.get("thickness", 2)))
-    pad = int(block.get("padding", 6))
+    thick = _d(ctx, max(1, int(block.get("thickness", 2))))
+    pad = _z(ctx, int(block.get("padding", 6)))
     style = str(block.get("style", "solid"))
-    img = _strip(thick + 2 * pad)
+    img = _strip(ctx, thick + 2 * pad)
     draw = ImageDraw.Draw(img)
-    x0, x1 = ctx["margin"], WIDTH - ctx["margin"]
+    x0, x1 = ctx["margin"], ctx["W"] - ctx["margin"]
     if style == "solid":
         draw.rectangle([x0, pad, x1 - 1, pad + thick - 1], fill=INK)
     else:
-        dash, space = (10, 6) if style == "dashed" else (thick, thick * 2)
+        dash, space = (_d(ctx, 10), _d(ctx, 6)) if style == "dashed" else (thick, thick * 2)
         x = x0
         while x < x1:
             draw.rectangle([x, pad, min(x + dash, x1) - 1, pad + thick - 1], fill=INK)
@@ -353,31 +372,32 @@ def _line(block: dict, ctx: dict) -> Image.Image:
 
 
 def _space(block: dict, ctx: dict) -> Image.Image:
-    return _strip(max(1, min(2000, int(block.get("height", 24)))))
+    return _strip(ctx, _d(ctx, max(1, min(2000, int(block.get("height", 24))))))
 
 
 def _row(block: dict, ctx: dict) -> Image.Image:
     """Left text and right text on one line (receipts, price lists, key/value)."""
-    font, fake_bold = _font(block)
-    margin = ctx["margin"]
+    font, fake_bold = _font(block, ctx)
+    margin, W = ctx["margin"], ctx["W"]
     left = expand(str(block.get("left", "")), ctx["now"])
     right = expand(str(block.get("right", "")), ctx["now"])
     right_w = int(font.getlength(right)) if right else 0
-    gap = 12 if right else 0
-    lines = wrap(left, font, WIDTH - 2 * margin - right_w - gap) or [""]
+    gap = _d(ctx, 12) if right else 0
+    lines = wrap(left, font, W - 2 * margin - right_w - gap) or [""]
     line_h = _line_height(font, float(block.get("spacing", 1.15)))
-    img = _strip(len(lines) * line_h)
+    img = _strip(ctx, len(lines) * line_h)
     draw = ImageDraw.Draw(img)
-    _draw_lines(draw, lines, font, fake_bold, margin, 0, WIDTH - 2 * margin - right_w - gap, "left", line_h, INK)
+    _draw_lines(draw, lines, font, fake_bold, margin, 0, W - 2 * margin - right_w - gap, "left", line_h, INK)
     if right:
-        _draw_lines(draw, [right], font, fake_bold, WIDTH - margin - right_w, 0, right_w, "left", line_h, INK)
+        _draw_lines(draw, [right], font, fake_bold, W - margin - right_w, 0, right_w, "left", line_h, INK)
     if block.get("leader") and right:  # dotted leader from the end of the text to the price
         last_w = font.getlength(lines[-1])
         y = (len(lines) - 1) * line_h + int(line_h * 0.7)
-        x = margin + int(last_w) + 6
-        while x < WIDTH - margin - right_w - 6:
-            draw.rectangle([x, y, x + 1, y + 1], fill=INK)
-            x += 6
+        dot, step = _d(ctx, 2), _d(ctx, 6)
+        x = margin + int(last_w) + step
+        while x < W - margin - right_w - step:
+            draw.rectangle([x, y, x + dot - 1, y + dot - 1], fill=INK)
+            x += step
     return img
 
 
@@ -392,16 +412,16 @@ def _items(block: dict) -> list[tuple[str, bool]]:
 
 
 def _list(block: dict, ctx: dict, checklist: bool = False) -> Image.Image:
-    font, fake_bold = _font(block)
+    font, fake_bold = _font(block, ctx)
     margin = ctx["margin"]
     line_h = _line_height(font, float(block.get("spacing", 1.2)))
-    mark = max(8, int(_px(font) * 0.75)) if checklist else max(4, _px(font) // 4)
-    indent = mark + max(8, _px(font) // 2)
-    width = WIDTH - 2 * margin - indent
+    mark = max(_d(ctx, 8), int(_px(font) * 0.75)) if checklist else max(_d(ctx, 4), _px(font) // 4)
+    indent = mark + max(_d(ctx, 8), _px(font) // 2)
+    width = ctx["W"] - 2 * margin - indent
     parts = []
     for text, done in _items(block):
         lines = wrap(expand(text, ctx["now"]), font, width) or [""]
-        img = _strip(len(lines) * line_h)
+        img = _strip(ctx, len(lines) * line_h)
         draw = ImageDraw.Draw(img)
         try:
             ascent = font.getmetrics()[0]
@@ -411,9 +431,9 @@ def _list(block: dict, ctx: dict, checklist: bool = False) -> Image.Image:
         if checklist:
             top = max(0, cy - mark // 2)
             box = [margin, top, margin + mark, top + mark]
-            draw.rectangle(box, outline=INK, width=max(2, mark // 10))
+            draw.rectangle(box, outline=INK, width=max(_d(ctx, 2), mark // 10))
             if done:
-                w = max(2, mark // 8)
+                w = max(_d(ctx, 2), mark // 8)
                 draw.line([margin + mark * 0.2, top + mark * 0.55, margin + mark * 0.45, top + mark * 0.8,
                            margin + mark * 0.85, top + mark * 0.2], fill=INK, width=w)
         else:
@@ -423,9 +443,10 @@ def _list(block: dict, ctx: dict, checklist: bool = False) -> Image.Image:
         if checklist and done and block.get("strike", True):
             for i, line in enumerate(lines):
                 y = i * line_h + cy
-                draw.line([margin + indent, y, margin + indent + font.getlength(line), y], fill=INK, width=2)
+                draw.line([margin + indent, y, margin + indent + font.getlength(line), y], fill=INK,
+                          width=_d(ctx, 2))
         parts.append(img)
-    return _stack(parts, gap=int(block.get("item_gap", 2))) if parts else _strip(1)
+    return _stack(ctx, parts, gap=_z(ctx, int(block.get("item_gap", 2)))) if parts else _strip(ctx, 1)
 
 
 def _banner(block: dict, ctx: dict) -> Image.Image:
@@ -435,8 +456,9 @@ def _banner(block: dict, ctx: dict) -> Image.Image:
         raise RenderError("banner block needs 'text'")
     family = str(block.get("font") or "sans")
     bold = bool(block.get("bold", True))
-    avail = WIDTH - 2 * ctx["margin"]
-    lo, hi = 20, 400
+    W = ctx["W"]
+    avail = W - 2 * ctx["margin"]
+    lo, hi = _d(ctx, 20), _d(ctx, 400)
     while lo < hi:  # the biggest size whose ink fits across the paper
         mid = (lo + hi + 1) // 2
         font, _ = fonts.load(family, mid, bold)
@@ -448,10 +470,10 @@ def _banner(block: dict, ctx: dict) -> Image.Image:
     font, fake_bold = fonts.load(family, lo, bold)
     box = font.getbbox(text)
     w, h = box[2] - box[0], box[3] - box[1]
-    pad = 16
-    canvas = Image.new("L", (w + 2 * pad, WIDTH), PAPER)
+    pad = _d(ctx, 16)
+    canvas = Image.new("L", (w + 2 * pad, W), PAPER)
     draw = ImageDraw.Draw(canvas)
-    y = (WIDTH - h) // 2 - box[1]
+    y = (W - h) // 2 - box[1]
     stroke = max(1, lo // 22) if fake_bold else 0
     draw.text((pad - box[0], y), text, font=font, fill=INK, stroke_width=stroke, stroke_fill=INK)
     return canvas.transpose(ROTATE_270)
@@ -471,11 +493,12 @@ RENDERERS = {
 }
 
 
-def _stack(parts: list[Image.Image], gap: int) -> Image.Image:
+def _stack(ctx: dict, parts: list[Image.Image], gap: int) -> Image.Image:
     height = sum(p.height for p in parts) + gap * max(0, len(parts) - 1)
-    if height > MAX_HEIGHT:
-        raise RenderError(f"print is {height} dots long; the limit is {MAX_HEIGHT} (about 2.5 m)")
-    out = _strip(height)
+    limit = round(MAX_HEIGHT * ctx["s"])
+    if height > limit:
+        raise RenderError(f"print is {height} dots long; the limit is {limit} (about 2.5 m)")
+    out = _strip(ctx, height)
     y = 0
     for p in parts:
         out.paste(p, (0, y))
@@ -518,8 +541,10 @@ def normalize(doc) -> dict:
     return doc
 
 
-def _mm_to_dots(mm) -> int:
-    return round(max(0.0, min(100.0, float(mm or 0))) * DOTS_PER_MM)
+def _mm_to_dots(mm, paper: Paper = DEFAULT_PAPER) -> int:
+    """DOTS_PER_MM (8) on the CTP500, as before; the paper's own resolution on other printers."""
+    per_mm = DOTS_PER_MM if paper.dpi == DEFAULT_PAPER.dpi else paper.dots_per_mm
+    return round(max(0.0, min(100.0, float(mm or 0))) * per_mm)
 
 
 # picture styles that print as photos (dithered tones) rather than lines and solid shapes
@@ -533,11 +558,15 @@ def has_photo(doc: dict) -> bool:
                for b in doc.get("blocks", []))
 
 
-def with_defaults(doc: dict, cfg: dict) -> dict:
+FINE_PHOTO_DARKNESS = "darkest"   # photos on finer dots (the M02 Pro) print light; see styles.FINE_DARKER
+
+
+def with_defaults(doc: dict, cfg: dict, paper: Paper | None = None) -> dict:
     """Fill in what the settings decide, unless the document sets it: the blank paper above and below, the photo
     look (photo_look: "punchy", or "even" = the measured tones, styles.thermal_photo) and the darkness: "even"
     photos print at light (the printer keeps far more tones apart there and black is just as black,
-    styles.PRINTED), everything else at darkness. A darkness of "auto" means the same as none."""
+    styles.PRINTED), punchy photos on finer dots (paper.fine: the M02 Pro) at FINE_PHOTO_DARKNESS, everything
+    else at darkness. A darkness of "auto" means the same as none."""
     for key in ("padding_top_mm", "padding_bottom_mm"):
         if key not in doc and cfg.get(key) is not None:
             doc[key] = cfg[key]
@@ -545,7 +574,12 @@ def with_defaults(doc: dict, cfg: dict) -> dict:
     if photo and doc.get("photo_look") not in PHOTO_LOOKS:
         doc["photo_look"] = cfg.get("photo_look") if cfg.get("photo_look") in PHOTO_LOOKS else "punchy"
     if doc.get("darkness") in (None, "", "auto"):
-        value = "light" if photo and doc["photo_look"] == "even" else cfg.get("darkness")
+        if photo and doc["photo_look"] == "even":
+            value = "light"
+        elif photo and paper is not None and paper.fine:
+            value = FINE_PHOTO_DARKNESS
+        else:
+            value = cfg.get("darkness")
         if value:
             doc["darkness"] = value
         else:
@@ -556,16 +590,19 @@ def with_defaults(doc: dict, cfg: dict) -> dict:
 with_padding = with_defaults   # its older name
 
 
-def render(doc, allow_files: bool = False, now: _dt.datetime | None = None) -> Image.Image:
-    """Document -> 1-bit full-width image, ready for raster.pack()."""
+def render(doc, allow_files: bool = False, now: _dt.datetime | None = None,
+           paper: Paper | None = None) -> Image.Image:
+    """Document -> 1-bit image as wide as the paper (the CTP500's by default), ready for raster.pack()."""
+    paper = paper or DEFAULT_PAPER
     doc = normalize(doc)
     try:   # the photo styles' tones depend on how dark it prints
         level = catproto.darkness_setting(None if doc.get("darkness") == "auto" else doc.get("darkness"))[0]
     except (TypeError, ValueError):
         level = catproto.DEFAULT_DARKNESS[0]
-    ctx = {"margin": max(0, min(80, int(doc.get("margin", 6)))), "allow_files": allow_files,
+    ctx = {"W": paper.width, "s": paper.scale, "allow_files": allow_files,
            "now": now or _dt.datetime.now(), "level": level,
            "look": doc.get("photo_look") if doc.get("photo_look") in PHOTO_LOOKS else "punchy"}
+    ctx["margin"] = _z(ctx, max(0, min(80, int(doc.get("margin", 6)))))
     parts = []
     for i, block in enumerate(doc["blocks"]):
         if not isinstance(block, dict):
@@ -582,10 +619,10 @@ def render(doc, allow_files: bool = False, now: _dt.datetime | None = None) -> I
             raise RenderError(f"block {i + 1} ({kind}): bad option ({exc})") from None
     if not parts:
         raise RenderError("nothing to print")
-    page = _stack(parts, gap=max(0, int(doc.get("gap", 6))))
-    top, bottom = (_mm_to_dots(doc.get(key, 0)) for key in ("padding_top_mm", "padding_bottom_mm"))
+    page = _stack(ctx, parts, gap=_z(ctx, max(0, int(doc.get("gap", 6)))))
+    top, bottom = (_mm_to_dots(doc.get(key, 0), paper) for key in ("padding_top_mm", "padding_bottom_mm"))
     if top or bottom:
-        page = _stack([p for p in (_strip(top) if top else None, page, _strip(bottom) if bottom else None)
-                       if p is not None], gap=0)
+        page = _stack(ctx, [p for p in (_strip(ctx, top) if top else None, page,
+                                        _strip(ctx, bottom) if bottom else None) if p is not None], gap=0)
     # Anti-aliased text edges go dark rather than vanish: thermal dots look thin otherwise.
     return page.point(lambda v: 255 if v > 170 else 0).convert("1", dither=raster.NO_DITHER)

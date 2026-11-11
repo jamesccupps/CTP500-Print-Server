@@ -32,6 +32,7 @@ CANDIDATES = {
     ),
 }
 FAMILIES = tuple(CANDIDATES)
+MAX_SIZE = 600    # px: 400 on the CTP500 (render caps by paper), 600 on 300 dpi paper
 
 
 @lru_cache(maxsize=None)
@@ -50,7 +51,7 @@ def font_path(family: str = "sans", bold: bool = False) -> str | None:
 def load(family: str = "sans", size: int = 24, bold: bool = False):
     """(font, fake_bold). fake_bold is True when no bold face was found and the caller should
     thicken strokes instead."""
-    size = max(6, min(400, int(size)))
+    size = max(6, min(MAX_SIZE, int(size)))
     path = font_path(family, bold)
     if path:
         return ImageFont.truetype(path, size), False

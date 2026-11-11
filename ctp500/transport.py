@@ -7,7 +7,9 @@ import socket
 import threading
 import time
 
-from . import catproto, protocol, simulate
+from . import catproto, phomemo, protocol, simulate
+
+AUTO_CHANNELS = range(1, 13)   # channel 0: try these until one takes the connection
 
 
 class TransportError(OSError):
@@ -19,7 +21,8 @@ class Cancelled(Exception):
 
 
 class BluetoothTransport:
-    """Bluetooth Classic SPP over a plain RFCOMM socket (works on Linux/BlueZ and Windows)."""
+    """Bluetooth Classic SPP over a plain RFCOMM socket (works on Linux/BlueZ and Windows). channel 0 tries
+    AUTO_CHANNELS until one takes the connection, and keeps that one."""
 
     def __init__(self, address: str, channel: int = 1, timeout: float = 12.0,
                  chunk_size: int = protocol.CHUNK_SIZE, chunk_delay: float = protocol.CHUNK_DELAY):
@@ -44,14 +47,20 @@ class BluetoothTransport:
     def open(self) -> None:
         if self._sock:
             return
-        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-        sock.settimeout(self.timeout)
-        try:
-            sock.connect((self.address, self.channel))
-        except OSError as exc:
-            sock.close()
-            raise TransportError(_explain(exc, self.address)) from None
-        self._sock = sock
+        for channel in ([self.channel] if self.channel else AUTO_CHANNELS):
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect((self.address, channel))
+            except OSError as exc:
+                sock.close()
+                if self.channel or not _refused(exc):   # off or out of range: other channels won't help
+                    raise TransportError(_explain(exc, self.address)) from None
+                continue
+            self._sock, self.channel = sock, channel
+            return
+        raise TransportError(f"couldn't connect to {self.address}: it refused every channel "
+                             f"({AUTO_CHANNELS[0]}-{AUTO_CHANNELS[-1]}); is it connected to a phone?")
 
     def close(self) -> None:
         sock, self._sock = self._sock, None
@@ -94,6 +103,8 @@ class BluetoothTransport:
                 if self.chunk_delay:
                     time.sleep(self.chunk_delay)
             self._last_write = time.monotonic()
+        except TransportError:     # flow() saw the printer say it can't go on (out of paper, lid open)
+            raise
         except OSError as exc:
             self.close()
             raise TransportError(f"lost the printer while sending ({exc})") from None
@@ -178,6 +189,11 @@ class BluetoothTransport:
             self._sock.settimeout(self.timeout)
 
 
+def _refused(exc: OSError) -> bool:
+    """Nothing listens on that channel (the printer is there, though)."""
+    return (getattr(exc, "errno", None) or getattr(exc, "winerror", None)) in (111, 10061)
+
+
 def _explain(exc: OSError, address: str) -> str:
     text = str(exc)
     hints = {
@@ -199,10 +215,12 @@ def _explain(exc: OSError, address: str) -> str:
 class SimulatedTransport:
     """Pretends to be the printer: decodes each job back into paper and saves it as a PNG."""
 
-    def __init__(self, out_dir: str, keep: int = 50, dialect: str = "cat"):
+    def __init__(self, out_dir: str, keep: int = 50, dialect: str = "cat", name: str = "simulated printer"):
         self.out_dir = out_dir
         self.keep = keep
         self.dialect = dialect      # which protocol it answers to when probed, like the real one
+        self.name = name
+        self.announce = b""         # phomemo: what the printer says by itself during the next job (tests)
         self._open = False
         self._buf = bytearray()
         self._replies = bytearray()
@@ -211,7 +229,6 @@ class SimulatedTransport:
         self.state_flags = 0        # what A3 answers (tests set 0x01 for "out of paper")
         os.makedirs(out_dir, exist_ok=True)
 
-    name = "simulated printer"
     INFO_REPLY = catproto.packet(catproto.DEVICE_INFO, b"SIMULATED")
 
     @property
@@ -236,6 +253,13 @@ class SimulatedTransport:
             if cancel is not None and cancel.is_set():
                 self._buf.clear()
                 raise Cancelled()
+            if flow is not None and self.announce and start:
+                said, self.announce = self.announce, b""
+                try:
+                    flow(said)
+                except TransportError:
+                    self._buf.clear()
+                    raise
             self._buf += data[start:start + 4096]
             if progress:
                 progress(min(len(data), start + 4096), len(data))
@@ -243,6 +267,8 @@ class SimulatedTransport:
         self._flush()
 
     def _answer(self, data: bytes) -> bytes:
+        if self.dialect == "phomemo":
+            return self._phomemo_answer(data)
         if self.dialect != "cat":
             return b""
         out = bytearray()
@@ -253,10 +279,25 @@ class SimulatedTransport:
                 out += self.INFO_REPLY
         return bytes(out)
 
+    def _phomemo_answer(self, data: bytes) -> bytes:
+        """1A frames for the 1F 11 questions in data (state_flags: 01 out of paper, 02 lid open)."""
+        out = bytearray()
+        replies = {phomemo.PAPER_QUERY: bytes([0x1A, phomemo.PAPER, 0x88 if self.state_flags & 1 else 0x89]),
+                   phomemo.LID_QUERY: bytes([0x1A, phomemo.LID, 0x99 if self.state_flags & 2 else 0x98]),
+                   phomemo.FIRMWARE_QUERY: bytes([0x1A, phomemo.FIRMWARE, 1, 0, 0]),
+                   phomemo.BATTERY_QUERY: bytes([0x1A, phomemo.BATTERY, 80])}
+        i = data.find(phomemo.SETTING)
+        while i >= 0:
+            out += replies.get(data[i:i + 3], b"")
+            i = data.find(phomemo.SETTING, i + 2)
+        return bytes(out)
+
     def request(self, command: bytes, timeout: float = 1.5) -> bytes:
         if not self._open:
             raise TransportError("not connected")
         reply = self._answer(command)
+        if self.dialect == "phomemo":
+            return reply
         if command.startswith(catproto.PREFIX):
             return reply
         return b"" if self.dialect == "cat" else b"SIMULATED\x00"
@@ -269,7 +310,7 @@ class SimulatedTransport:
         if not self._buf:
             return
         data, self._buf = bytes(self._buf), bytearray()
-        paper, info = simulate.decode(data)
+        paper, info = simulate.decode(data, self.dialect)
         self.last_info = info
         if paper is None:
             return

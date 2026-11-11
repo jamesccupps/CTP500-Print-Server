@@ -7,19 +7,22 @@ import struct
 
 from PIL import Image
 
-from . import catproto, protocol, raster
+from . import catproto, phomemo, protocol, raster
 
 FEED_DOTS = 32   # an ESC/POS line feed is about 4 mm at 203 dpi
+PHOMEMO_LINE_DOTS = 50   # ESC d n on the M02 Pro: assumed ESC/POS's default 1/6 inch line (not measured)
 
 
 class DecodeError(ValueError):
     pass
 
 
-def decode(stream: bytes) -> tuple[Image.Image | None, dict]:
-    """(paper image or None, info) for either dialect."""
+def decode(stream: bytes, dialect: str | None = None) -> tuple[Image.Image | None, dict]:
+    """(paper image or None, info) for any dialect."""
     if stream.startswith(catproto.PREFIX):
         return decode_cat(stream)
+    if dialect == "phomemo" or stream.startswith(phomemo.INIT + phomemo.SETTING):
+        return decode_phomemo(stream)
     return decode_escpos(stream)
 
 
@@ -108,4 +111,72 @@ def decode_escpos(stream: bytes) -> tuple[Image.Image | None, dict]:
     for s in strips:
         paper.paste(s, (0, y))
         y += s.height
+    return paper, info
+
+
+PHOMEMO_ARGS = {0x02: 1, 0x37: 1, 0x35: 1}   # 1F 11 settings that carry a value; the rest are bare
+
+
+def decode_phomemo(stream: bytes) -> tuple[Image.Image | None, dict]:
+    """The Phomemo M02 Pro's jobs (phomemo.build_job). info has 'density', 'coefficient', 'inits', 'rasters',
+    'rows', 'width', 'feed_dots' (ESC J) and 'feed_lines' (ESC d)."""
+    info = {"dialect": "phomemo", "density": None, "coefficient": None, "inits": 0, "rasters": 0, "rows": 0,
+            "width": None, "feed_dots": 0, "feed_lines": 0, "settings": []}
+    strips: list[tuple[str, int, bytes]] = []
+    i, n = 0, len(stream)
+    while i < n:
+        if stream.startswith(phomemo.INIT, i):
+            info["inits"] += 1
+            i += 2
+        elif stream.startswith(phomemo.SETTING, i):
+            if i + 2 >= n:
+                raise DecodeError("setting cut short")
+            op = stream[i + 2]
+            args = PHOMEMO_ARGS.get(op, 0)
+            if i + 3 + args > n:
+                raise DecodeError(f"setting 1f 11 {op:02x} cut short")
+            value = stream[i + 3] if args else None
+            info["settings"].append(op)
+            if op == 0x02:
+                info["density"] = value
+            elif op == 0x37:
+                info["coefficient"] = value
+            i += 3 + args
+        elif stream.startswith(phomemo.RASTER_PREFIX, i):
+            if i + 8 > n:
+                raise DecodeError("raster header cut short")
+            width_bytes, lines = struct.unpack_from("<HH", stream, i + 4)
+            if info["width"] not in (None, width_bytes * 8):
+                raise DecodeError("raster blocks of different widths")
+            info["width"] = width_bytes * 8
+            start, end = i + 8, i + 8 + width_bytes * lines
+            if end > n:
+                raise DecodeError(f"raster block wants {end - start} bytes, only {n - start} sent")
+            strips.append(("rows", lines, stream[start:end]))
+            info["rasters"] += 1
+            info["rows"] += lines
+            i = end
+        elif stream.startswith(phomemo.FEED_DOTS, i) or stream.startswith(phomemo.FEED_LINES, i):
+            if i + 2 >= n:
+                raise DecodeError("feed cut short")
+            lines = stream[i + 2]
+            if stream[i + 1] == 0x4A:
+                info["feed_dots"] += lines
+                strips.append(("feed", lines, b""))
+            else:
+                info["feed_lines"] += lines
+                strips.append(("feed", lines * PHOMEMO_LINE_DOTS, b""))
+            i += 3
+        else:
+            raise DecodeError(f"unknown byte 0x{stream[i]:02x} at offset {i}")
+    if not info["rows"]:
+        return None, info
+    width = info["width"]
+    parts = [raster.unpack(data, h, width) if kind == "rows" else Image.new("1", (width, h), 1)
+             for kind, h, data in strips if h]
+    paper = Image.new("1", (width, sum(p.height for p in parts)), 1)
+    y = 0
+    for p in parts:
+        paper.paste(p, (0, y))
+        y += p.height
     return paper, info

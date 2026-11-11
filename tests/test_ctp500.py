@@ -403,8 +403,14 @@ class ServerTests(unittest.TestCase):
         self.assertIn("attachment", headers["Content-Disposition"])
         with zipfile.ZipFile(io.BytesIO(body)) as z:
             self.assertEqual({n: z.read(n) for n in z.namelist()}, photos)
-        leftovers = [f for f in os.listdir(os.path.join(self.tmp.name, "camera")) if f.endswith(".zip")]
-        self.assertEqual(leftovers, [])                                          # the temp zip is gone
+        def leftovers():
+            return [f for f in os.listdir(os.path.join(self.tmp.name, "camera")) if f.endswith(".zip")]
+        # the server removes the temp zip just after the last byte goes out, so it may still be there for a moment
+        # (a slow Windows runner looked too soon once, 2026-11-11)
+        deadline = time.monotonic() + 5
+        while leftovers() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(leftovers(), [])                                        # the temp zip is gone
 
     def test_photo_browser_support(self):
         png = io.BytesIO()
@@ -820,6 +826,45 @@ class StuckPixelTests(unittest.TestCase):
         big = self.shot((2048, 1536))
         self.assertEqual(camera.fix_stuck_pixel(big, camera.STUCK_PIXEL), big)  # phone-sized: untouched
         self.assertEqual(camera.fix_stuck_pixel(data), data)                # not set up: untouched
+
+    def test_column_streaks_come_out_of_photos_only(self):
+        import numpy as np
+        from unittest import mock
+        from ctp500 import camera
+        w, h = 1600, 400                                     # the camera's width: the bands are measured for it
+        base = Image.new("RGB", (w, h))
+        draw = ImageDraw.Draw(base)
+        for y in range(h):                                   # a gradient and a dark disc: content, not streaks
+            draw.line([(0, y), (w, y)], fill=(80 + y * 100 // h, 70, 90))
+        draw.ellipse([500, 80, 800, 330], fill=(40, 30, 50))
+        rng = np.random.default_rng(7)
+        a = np.asarray(base, dtype=np.int16).copy()
+        for x in rng.choice(w, 160, replace=False):          # the sensor's columns, the same all the way down
+            a[:, x] += int(rng.choice((-1, 1)) * rng.integers(12, 40))
+        a += np.round(6 * np.sin(np.arange(w) * 2 * np.pi / 60)).astype(np.int16)[None, :, None]  # + wide bands
+        a += rng.integers(-3, 4, a.shape, dtype=np.int16)    # and some grain, like a real shot
+        streaky = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8), "RGB")
+
+        def spread(img):
+            return camera._column_offsets(np.asarray(img, dtype=np.float32), slice(None)).std()
+
+        def bands(img):
+            return camera._bands(np.asarray(img, dtype=np.float32), 1).std()
+        self.assertGreater(spread(streaky), 4)
+        fixed = camera.destripe(streaky)
+        self.assertLess(spread(fixed), 1)
+        self.assertGreater(bands(streaky), 2)
+        self.assertLess(bands(fixed), bands(streaky) / 3)
+        self.assertIs(camera.destripe(base), base)           # nothing to take out: the same picture back
+        # only photos (JPEG) go through it: a PNG drawing with fine vertical lines is the drawing
+        calls = []
+        with mock.patch.object(camera, "destripe", lambda img: calls.append(img.size) or img):
+            for fmt in ("JPEG", "PNG"):
+                buf = io.BytesIO()
+                streaky.save(buf, fmt)
+                render.render({"blocks": [{"type": "image", "style": "floyd",
+                                           "data": base64.b64encode(buf.getvalue()).decode()}]})
+        self.assertEqual(calls, [(w, h)])
 
     def test_gallery_stores_the_fixed_shot_once(self):
         from ctp500 import camera

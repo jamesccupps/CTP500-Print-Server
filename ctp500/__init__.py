@@ -1,3 +1,4 @@
-"""Print to a Core Innovations CTP500 Bluetooth thermal printer: library, print server and command line."""
+"""Print to a Core Innovations CTP500 (or Phomemo M02 Pro) Bluetooth thermal printer: library, print server and
+command line."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -195,6 +195,7 @@
     </div>
     <div class="meta" id="meta">&nbsp;</div>
     <div class="printbar">
+      <label id="printer-pick" hidden>Printer <select id="printer" title="Which printer this prints on"></select></label>
       <label>Darkness
         <select id="darkness" title="Auto: photos print at the photo darkness (Settings), everything else at normal">
           <option value="auto" selected>Auto</option>
@@ -255,6 +256,10 @@
     <p class="hint">Punchy keeps light areas clean and shadows bold: best for dim shots. Even prints lighter, with
       the gray steps measured on this printer kept apart: try it for bright, detailed photos.</p>
     <h3>Camera prints</h3>
+    <div class="setting" id="cam-printer-row" hidden>
+      <label for="cam-printer">Printer</label>
+      <select id="cam-printer"></select>
+    </div>
     <div class="setting">
       <label for="cam-style">Style</label>
       <select id="cam-style">

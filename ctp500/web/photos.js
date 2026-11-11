@@ -238,6 +238,7 @@ async function downloadReady() {
 
 function overrides() {
   const out = {};
+  if ($("#viewer-printer").value) out.printer = $("#viewer-printer").value;
   if ($("#viewer-style").value) out.style = $("#viewer-style").value;
   if ($("#viewer-weight").value) out.weight = Number($("#viewer-weight").value);
   if ($("#viewer-zoom").value) out.zoom = $("#viewer-zoom").value === "1";
@@ -294,7 +295,7 @@ function cancelPendingPrint(silent = false) {
   clearInterval(pendingPrint);
   pendingPrint = null;
   resetPrintButton();
-  if (!silent) toast("Print cancelled");
+  if (!silent) toast("Print canceled");
 }
 
 function resetPrintButton() {
@@ -398,6 +399,19 @@ function init() {
   $("#viewer-weight").onchange = $("#viewer-style").onchange;
   $("#viewer-zoom").onchange = $("#viewer-style").onchange;
   $("#viewer-sharpen").onchange = $("#viewer-style").onchange;
+  $("#viewer-printer").onchange = () => { store.set("photo-printer", $("#viewer-printer").value); $("#viewer-style").onchange(); };
+  // with more than one printer, which one Print uses (the camera setting's by default)
+  api("/api/status").then(s => {
+    const list = s.printers || [];
+    if (list.length < 2) return;
+    const pick = $("#viewer-printer");
+    const cam = list.find(p => p.id === s.camera_printer) || list[0];
+    pick.replaceChildren(new Option(`Printer: ${cam.label} (camera setting)`, ""),
+      ...list.map(p => new Option(`Printer: ${p.label}`, p.id)));
+    const stored = store.get("photo-printer", "");
+    pick.value = list.some(p => p.id === stored) ? stored : "";
+    pick.hidden = false;
+  }).catch(() => {});
 
   document.addEventListener("keydown", e => {
     if ($("#viewer").hidden) return;
