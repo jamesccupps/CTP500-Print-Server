@@ -36,6 +36,7 @@ MODELS = {
 _sessions: dict = {}
 _lock = threading.Lock()
 PROVIDERS = ["CPUExecutionProvider"]   # the PC helper puts its graphics card (CUDA) first
+RUN_OPTIONS = None    # the PC helper's onnxruntime.RunOptions: its GPU memory pool is given back after each run
 
 # The model's cost grows with its pixel count; past this width a 48 mm print gains nothing. Sideways prints asked
 # for ~830 px and took ~5 s per drawing on the Pi (2026-10-30); 640 cuts that by ~40%.
@@ -198,7 +199,7 @@ def infer(name: str, picture: Image.Image) -> Image.Image:
     x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
     session = _session(name)
     with _lock:  # one inference at a time: the Pi has 4 cores and they're all used per run
-        y = session.run(None, {session.get_inputs()[0].name: x})[0][0, 0]
+        y = session.run(None, {session.get_inputs()[0].name: x}, RUN_OPTIONS)[0][0, 0]
     return Image.fromarray((np.clip(y, 0.0, 1.0) * 255).astype(np.uint8), "L")
 
 
@@ -213,7 +214,7 @@ def depth(img: Image.Image, long_side: int = 518) -> np.ndarray:
     x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
     session = _session("depth")
     with _lock:
-        y = session.run(None, {session.get_inputs()[0].name: x})[0]
+        y = session.run(None, {session.get_inputs()[0].name: x}, RUN_OPTIONS)[0]
     return np.asarray(y, np.float32).reshape(h, w)
 
 

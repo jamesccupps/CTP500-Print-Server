@@ -22,6 +22,7 @@ MAX_FACES = 6
 _sessions: dict = {}
 _lock = threading.Lock()
 PROVIDERS = ["CPUExecutionProvider"]
+RUN_OPTIONS = None        # set by the helper's GPU process: the GPU memory pool is given back after each run
 IDLE_S = 900              # a model unused this long is let go (~0.5 GB of memory each; reloading takes ~2 s)
 _used = 0.0
 
@@ -103,7 +104,7 @@ def enhance_crop(crop: Image.Image, model: str, fidelity: float = 0.7) -> Image.
         else:
             feed[i.name] = np.ascontiguousarray(x, np.float32)
     with _lock:
-        y = session.run(None, feed)[0][0]
+        y = session.run(None, feed, RUN_OPTIONS)[0][0]
     y = (np.clip(y, -1, 1) + 1) / 2 * 255
     return Image.fromarray(np.rint(y.transpose(1, 2, 0)).astype(np.uint8), "RGB")
 

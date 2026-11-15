@@ -78,7 +78,7 @@ def _detect(rgb: Image.Image) -> list[Face]:
     session = ai._session("faces")
     names = [o.name for o in session.get_outputs()]
     with ai._lock:
-        out = dict(zip(names, session.run(None, {session.get_inputs()[0].name: x})))
+        out = dict(zip(names, session.run(None, {session.get_inputs()[0].name: x}, ai.RUN_OPTIONS)))
     boxes, scores, eyes = [], [], []
     for stride in (8, 16, 32):
         cols, rows = pw // stride, ph // stride

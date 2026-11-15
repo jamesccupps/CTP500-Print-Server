@@ -12,6 +12,10 @@ The print server runs fine on its own. While a Windows PC runs this helper, the 
 The helper only calls out to the server (no firewall rule needed). When the PC is off or asleep, the server does
 everything itself again.
 
+It stays small while idle (about 25 MB): the AI models and the graphics card's libraries load in a separate process
+on the first drawing (about 1 s), and that process closes after 10 minutes without a job. While it runs it
+commits about 1.3 GB (2.3 GB with face sharpening loaded).
+
 ## Set it up
 
 Needs Python 3.10–3.12 from [python.org](https://www.python.org/downloads/windows/) (or
