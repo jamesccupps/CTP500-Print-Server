@@ -69,7 +69,8 @@ libraries from the [CircuitPython bundle](https://circuitpython.org/libraries) t
 | `IDLE_DIM_AFTER`, `DEEP_SLEEP_AFTER` | seconds before the screen dims / it sleeps (0 = never) |
 | `CAMERA_DENOISE`, `CAMERA_SHARPNESS`, `CAMERA_AWB` | sensor tuning: 0-8, -3..3, `"simple"` white balance for colored LED light |
 
-If the server has a token, end both URLs with `?token=<token>` (`install.py` does this for you).
+If the server has a token, end both URLs with `?token=<token>` (`install.py` does this for you). Without it the
+server refuses the photos: the camera shows **Check token** and keeps them waiting until the URLs have it.
 
 ## Troubleshooting
 

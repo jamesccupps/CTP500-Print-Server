@@ -72,8 +72,14 @@ sudo systemctl restart ctp500
 ```
 
 The first command shows the token. The web app asks for it once per browser; scripts send
-`Authorization: Bearer <token>`. To use it away from home,
+`Authorization: Bearer <token>`. Give it to the camera and the PC helper before you restart: the camera keeps its
+photos waiting (and shows "Check token") until its URLs have it ([camera](camera/README.md)), the helper takes it
+as `"token"` in its `helper.json`. To use it away from home,
 [Tailscale](https://tailscale.com) on the Pi and your phone works well.
+
+Even without a token, other web sites can't use the server: it only answers to its IP address, one-word names
+(`raspberrypi`, a Tailscale name), `.local`, `.home.arpa`, `.internal` and `.ts.net` names, so a page can't point
+a name of its own at it. Reach it by another name? Add it: `python3 -m ctp500 config allowed_hosts=printer.example.com`.
 
 **Update:** `cd ~/ctp500 && git pull && ./pi/install.sh` (your settings and photos stay).
 
@@ -217,6 +223,8 @@ On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints direc
 | `printer`, `protocol` | the printer's Bluetooth address; `auto` (default), `cat` or `escpos` |
 | `printers`, `camera_printer` | more printers (`add-printer` fills this in: `[{"model": "m02pro", "address": "..."}]`, optional `id`, `name`, `channel`, `feed`); the id of the printer camera prints go to (default: the main one) |
 | `port`, `token` | the web app's port (8500); a token to require (above) |
+| `allowed_hosts` | more names the server answers to, comma-separated (above) |
+| `helper_token` | the PC helper's own token, made on the first start (`python3 -m ctp500 helper-token` shows it) |
 | `darkness`, `feed`, `padding_top_mm`, `padding_bottom_mm` | print darkness; paper fed at the end; blank paper around prints (6 mm) |
 | `photo_look` | `punchy` (default: clean light areas, bold shadows) or `even` (more gray steps, prints at Light) |
 | `camera_style`, `camera_detail`, `camera_weight`, `camera_frame`, `camera_sideways`, `camera_caption`, `camera_zoom`, `camera_sharpen` | how camera photos print |
@@ -237,6 +245,10 @@ On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints direc
 - **The M02 Pro doesn't connect:** it must be paired (`add-printer` does that) and not connected to its phone
   app. The server tries its Bluetooth channels until one answers; `journalctl -u ctp500 -f` shows what happens.
 - **The web app doesn't open:** `systemctl status ctp500` and `journalctl -u ctp500 -f` show what's wrong.
+  "This server doesn't answer to the name ...": open it by its address, or add the name to `allowed_hosts`.
+- **The PC helper stopped taking jobs after an update** (1.2.0): it needs the server's helper token now. Run
+  `cd ~/ctp500 && python3 -m ctp500 helper-token` and add it to the helper's `helper.json` as `"helper_token"`
+  (or run `desktop\install.ps1 -HelperToken <it>`).
 
 ## How it works
 

@@ -1,5 +1,5 @@
 """The PC helper's settings: desktop/helper.json (copy helper.example.json; it stays out of git), and environment
-variables, which win: CTP500_SERVER, CTP500_TOKEN, CTP500_HELPER_HOME."""
+variables, which win: CTP500_SERVER, CTP500_TOKEN, CTP500_HELPER_TOKEN, CTP500_HELPER_HOME."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ _cfg = _load()
 
 SERVER = (os.environ.get("CTP500_SERVER") or _cfg.get("server") or "").rstrip("/")   # the print server's address
 TOKEN = os.environ.get("CTP500_TOKEN") or _cfg.get("token") or ""                    # if the server has a token
+# the server's helper token (python -m ctp500 helper-token on the server): only the helper is sent its jobs
+HELPER_TOKEN = os.environ.get("CTP500_HELPER_TOKEN") or _cfg.get("helper_token") or ""
 # Its Python, models and log (a few GB with PyTorch: put it on a roomy drive)
 HOME = (os.environ.get("CTP500_HELPER_HOME") or _cfg.get("home")
         or os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ctp500-helper"))

@@ -24,6 +24,7 @@ import base64
 import collections
 import hmac
 import io
+import ipaddress
 import itertools
 import json
 import mimetypes
@@ -40,8 +41,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image
 
-from . import __version__, camera, config, litho, markup, offload, protocol, raster, render
-from .printer import Printer, PrinterNotReady
+from . import __version__, camera, config, gcode, litho, markup, offload, protocol, raster, render
+from .printer import Printer, PrinterNotReady, feed_lines
 from .transport import Cancelled, TransportError
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -49,6 +50,10 @@ MAX_BODY = 40 * 1024 * 1024
 CAMERA_OVERRIDES = ("style", "detail", "weight", "frame", "caption", "sideways", "zoom", "sharpen", "printer")
 IMAGE_OPTIONS = ("dither", "style", "detail", "weight", "brightness", "contrast", "width", "rotate", "threshold",
                  "auto_contrast", "invert", "align")
+
+
+class _TooBig(ValueError):
+    """A request body over MAX_BODY (413)."""
 
 
 class Job:
@@ -68,7 +73,7 @@ class Job:
         self.height = 0
         self.copies = max(1, min(20, int(doc.get("copies", 1))))
         self.darkness = doc.get("darkness")
-        self.feed = int(doc.get("feed", 2))
+        self.feed = feed_lines(doc.get("feed", 2))
         self.cancel = threading.Event()
         self.finished = threading.Event()
         self.image: Image.Image | None = None
@@ -193,8 +198,9 @@ class PrintService:
         return out.copy()
 
     def ready_print(self, name: str, size: float, shape: str) -> bytes:
-        """A lithophane sliced for the A1 mini by Bambu Studio on the PC (its helper checks the G-code), as a
-        .gcode.3mf to open and print. offload.Unavailable when the PC isn't on."""
+        """A lithophane sliced for the A1 mini by Bambu Studio on the PC, as a .gcode.3mf to open and print: the
+        helper checks the G-code against Bambu Studio's own, and this checks it again (gcode.check_sliced), so a
+        file that fails never reaches the browser. offload.Unavailable when the PC isn't on."""
         data = self.camera.read(name)
         key = (name, len(data), size, shape)
         with self._lock:
@@ -204,6 +210,10 @@ class PrintService:
         stl = litho.stl(*litho.mesh(t, res, "flat" if shape == "relief" else shape), name=name)
         out, _ = self.offload.run("slice", stl, {"name": os.path.splitext(name)[0], "size": size, "shape": shape},
                                   timeout=300)
+        try:
+            gcode.check_sliced(out)
+        except ValueError as exc:
+            raise RuntimeError(f"the PC's sliced file failed the check: {exc}") from None
         with self._lock:
             self._ready_prints[key] = out
             while len(self._ready_prints) > 4:
@@ -618,6 +628,39 @@ def _product(shape: str) -> str:
     return "relief-plaque" if shape == "relief" else f"lithophane-{shape}"
 
 
+# Names that can't be pointed at this server from outside (DNS rebinding: a web page whose own name is made to point
+# at the server could otherwise read the photos), besides IP addresses and one-word names: mDNS, the home and
+# internal names set aside for local networks, Tailscale's MagicDNS.
+LOCAL_SUFFIXES = (".local", ".localhost", ".home.arpa", ".internal", ".ts.net")
+
+
+def host_allowed(host: str | None, allowed=()) -> bool:
+    """Whether a request's Host header names this server in a way no outside web page can: an IP address, a
+    one-word name (raspberrypi, a Tailscale name), a LOCAL_SUFFIXES name, or one of allowed (a list, or a
+    comma-separated string from `config allowed_hosts=...`). No Host header at all (old HTTP/1.0 scripts) is fine:
+    browsers always send one."""
+    if host is None:
+        return True
+    host = host.strip().lower()
+    if host.startswith("["):                    # [IPv6]:port
+        name = host[1:].split("]", 1)[0]
+    else:
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    name = name.rstrip(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    if "." not in name or name.endswith(LOCAL_SUFFIXES) or name == "localhost":
+        return True
+    if isinstance(allowed, str):
+        allowed = allowed.split(",")
+    return name in {str(a).strip().lower().rstrip(".") for a in (allowed or ())}
+
+
 def _coerce(value: str):
     low = value.lower()
     if low in ("true", "yes", "on"):
@@ -637,6 +680,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"ctp500/{__version__}"
     service: PrintService = None  # set by serve()
     quiet = False
+    timeout = 120                 # seconds a connection may sit idle (each holds a thread)
 
     # ------------------------------------------------------------ plumbing
 
@@ -688,13 +732,23 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, code: int, message: str) -> None:
         self._json(code, {"error": message})
 
+    def send_response(self, code, message=None):
+        self._answered = True       # past this point an error can't be sent as an answer any more
+        super().send_response(code, message)
+
     def _read_body(self) -> None:
         """Read the whole body up front: answering without reading it makes Windows reset the connection,
         so the caller would never see the error message."""
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self.close_connection = True
+            raise ValueError("Content-Length isn't a number of bytes")
         if length > MAX_BODY:
             self.close_connection = True
-            raise ValueError(f"request is too big ({length // 1048576} MB; the limit is {MAX_BODY // 1048576} MB)")
+            raise _TooBig(f"request is too big ({length // 1048576} MB; the limit is {MAX_BODY // 1048576} MB)")
         self._raw = self.rfile.read(length) if length > 0 else b""
 
     def _body(self) -> bytes:
@@ -717,7 +771,27 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
             given = auth[7:].strip()
-        return hmac.compare_digest(str(given), str(token))
+        return hmac.compare_digest(str(given).encode("utf-8", "replace"), str(token).encode("utf-8"))
+
+    def _helper_ok(self) -> bool:
+        """The PC helper's calls also need its own secret (X-Helper-Token): anyone else who polled would be sent
+        the photos it works on and could answer its jobs with files of their own."""
+        expected = str(self.service.cfg.get("helper_token") or "")
+        given = self.headers.get("X-Helper-Token", "")
+        return bool(expected) and hmac.compare_digest(given.encode("utf-8", "replace"), expected.encode("utf-8"))
+
+    def _host_ok(self) -> bool:
+        return host_allowed(self.headers.get("Host"), self.service.cfg.get("allowed_hosts") or ())
+
+    def _wrong_host(self):
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0][:100]
+        return self._error(403, f"this server doesn't answer to the name {host}: use its address, or add the name "
+                                f"to \"allowed_hosts\" in its settings (python -m ctp500 config allowed_hosts={host})")
+
+    def _helper_refused(self):
+        return self._error(401, "this is the PC helper's call: it needs the helper token. On the print server run "
+                                "python -m ctp500 helper-token and put it in the helper's helper.json as "
+                                "\"helper_token\"")
 
     def _same_origin(self) -> bool:
         """Browsers send Origin on cross-site posts; scripts and Home Assistant don't. Refusing foreign
@@ -738,11 +812,29 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
-        path, query = self._parse()
-        if not path.startswith("/api/"):
-            return self._static(path)
-        if not self._authorized(query):
-            return self._error(401, "this printer needs its access token")
+        self._answered = False
+        try:
+            path, query = self._parse()
+            if not self._host_ok():
+                return self._wrong_host()
+            if not path.startswith("/api/"):
+                return self._static(path)
+            if not self._authorized(query):
+                return self._error(401, "this printer needs its access token")
+            return self._get(path, query)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True        # the caller went away
+        except Exception as exc:
+            if self._answered:                  # halfway through an answer: all that's left is to hang up
+                traceback.print_exc()
+                self.close_connection = True
+            elif isinstance(exc, (ValueError, TypeError)):
+                self._error(400, str(exc))
+            else:
+                traceback.print_exc()
+                self._error(500, f"{type(exc).__name__}: {exc}")
+
+    def _get(self, path: str, query: dict):
         svc = self.service
         if path == "/api/status":
             return self._json(200, svc.status())
@@ -756,6 +848,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/camera/litho/"):
             return self._lithophane(path[len("/api/camera/litho/"):], query)
         if path == "/api/helper/next":     # the PC helper's long poll (offload.py)
+            if not self._helper_ok():
+                return self._helper_refused()
             job = svc.offload.next([k for k in query.get("kinds", "").split(",") if k], query.get("name", ""),
                                    min(25.0, float(query.get("wait", 25))))
             if job is None:
@@ -832,11 +926,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, f"{type(exc).__name__}: {exc}")
 
     def do_POST(self):
+        self._answered = False
         path, query = self._parse()
         try:
             self._read_body()
-        except ValueError as exc:
+        except _TooBig as exc:
             return self._error(413, str(exc))
+        except ValueError as exc:
+            return self._error(400, str(exc))
+        except OSError:                     # the caller went away (or stalled) mid-body
+            self.close_connection = True
+            return
+        if not self._host_ok():
+            return self._wrong_host()
         if not self._same_origin():
             return self._error(403, "prints from other web sites aren't allowed")
         if not self._authorized(query):
@@ -852,7 +954,13 @@ class Handler(BaseHTTPRequestHandler):
         except TransportError as exc:
             return self._error(503, str(exc))
         except Exception as exc:
+            if self._answered and isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                self.close_connection = True    # the caller hung up while being answered
+                return None
             traceback.print_exc()
+            if self._answered:
+                self.close_connection = True
+                return None
             return self._error(500, f"{type(exc).__name__}: {exc}")
 
     def _post(self, path: str, query: dict):
@@ -924,12 +1032,14 @@ class Handler(BaseHTTPRequestHandler):
                     "X-Print-Length-Mm": str(round(height * 25.4 / dpi))})
             return self._queued(svc.camera_print(name, overrides, source), query)
         if path.startswith("/api/helper/result/"):   # the PC helper's answer to a job
+            if not self._helper_ok():
+                return self._helper_refused()
             meta = json.loads(self.headers.get("X-Job-Meta") or "{}")
             taken = svc.offload.result(path[len("/api/helper/result/"):], self._body(), meta,
                                        self.headers.get("X-Job-Error"))
             return self._json(200, {"taken": taken})
         if path == "/api/feed":
-            svc.pick(query.get("printer")).feed(int(query.get("lines", 3)))
+            svc.pick(query.get("printer")).feed(feed_lines(query.get("lines", 3)))
             return self._json(200, {"ok": True})
         if path == "/api/check":
             printer = svc.pick(query.get("printer"))
@@ -946,7 +1056,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _queued(self, job: Job, query: dict):
         if query.get("wait") in ("1", "true", "yes"):
-            until = time.monotonic() + float(query.get("timeout", 120))
+            until = time.monotonic() + max(0.0, min(600.0, float(query.get("timeout", 120))))
             while not job.finished.wait(0.2) and job.status != "waiting" and time.monotonic() < until:
                 pass                        # answers when it's printed, or waiting for the printer
             code = 200 if job.status == "done" else (202 if job.status in ("queued", "printing", "waiting") else 502)
@@ -978,6 +1088,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(printer, cfg: dict, quiet: bool = False) -> ThreadingHTTPServer:
     """Start the server (call serve_forever() on the result). printer: one Printer or a list, main first."""
+    config.helper_token(cfg)          # made (and saved) on the first start: the PC helper needs it
     service = PrintService(printer, cfg)
     handler = type("BoundHandler", (Handler,), {"service": service, "quiet": quiet})
     httpd = ThreadingHTTPServer((cfg.get("host", "0.0.0.0"), int(cfg.get("port", 8500))), handler)

@@ -1182,10 +1182,13 @@ def compact_manifest():
 
 
 _sync_away_until = 0      # after finding only the print box, automatic syncs rest a while
+_refused = False          # the server answered 401/403: its token isn't in this camera's URLs
 
 
 def _send_waiting(pool, files):
     # Upload photos the Pi doesn't have yet; returns how many it took.
+    global _refused
+    _refused = False
     session = adafruit_requests.Session(pool)
     sent = 0
     for idx, name in enumerate(files):
@@ -1204,7 +1207,11 @@ def _send_waiting(pool, files):
         if status in (200, 204):
             _mark_uploaded(name)
             sent += 1
-        elif 400 <= status < 500:        # permanent reject: skip, don't wedge
+        elif status in (401, 403):       # the server wants its token: keep every photo waiting until it's set
+            print("server refused uploads:", status, "(check the token in settings.toml)")
+            _refused = True
+            break
+        elif 400 <= status < 500:        # permanent reject (not a picture, too big): skip, don't wedge
             print("server rejected", name, status)
             _mark_uploaded(name)
         else:
@@ -1214,7 +1221,8 @@ def _send_waiting(pool, files):
 
 
 def sync(force=False):
-    global _sync_away_until
+    global _sync_away_until, _refused
+    _refused = False
     files = pending()
     if not (SSID and PASSWORD and SERVER):
         if force:
@@ -1262,6 +1270,10 @@ def sync(force=False):
         pycam.display_message("Synced %d" % sent, color=0x00FF00)
         pycam.tone(1200, 0.06)
         time.sleep(0.5)
+    elif _refused:
+        pycam.display_message("Check token", color=0xFF0000)
+        pycam.tone(400, 0.15)
+        time.sleep(0.9)
     elif force:
         pycam.display_message("Sync at home" if away else "Up to date", color=0xEF9F27)
         time.sleep(0.6)
@@ -1360,7 +1372,8 @@ def print_photo(name):
         time.sleep(0.6)
         return True
     print("print failed:", status)
-    pycam.display_message("No printer" if status is None else "Print error", color=0xFF0000)
+    pycam.display_message("No printer" if status is None else "Check token" if status in (401, 403)
+                          else "Print error", color=0xFF0000)
     pycam.tone(400, 0.15)
     time.sleep(0.9)
     return False

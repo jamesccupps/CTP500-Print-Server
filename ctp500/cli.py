@@ -320,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("config", help="show or change saved settings: config printer=AA:BB:.. port=8500")
     p.add_argument("pairs", nargs="*")
+    sub.add_parser("helper-token", help="show the PC helper's token (for its helper.json)")
     return ap
 
 
@@ -341,9 +342,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+    if args.command == "helper-token":
+        print(config.helper_token(cfg))
+        return 0
+
     if args.command == "config":
         if not args.pairs:
-            shown = {k: ("***" if k == "token" and v else v) for k, v in cfg.items() if not k.startswith("_")}
+            shown = {k: ("***" if k in ("token", "helper_token") and v else v) for k, v in cfg.items()
+                     if not k.startswith("_")}
             print(json.dumps(shown, indent=2))
             print(f"(from {cfg['_path']})")
             return 0
@@ -356,7 +362,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: unknown setting {key} (known: {', '.join(config.DEFAULTS)})", file=sys.stderr)
                 return 2
             default = config.DEFAULTS[key]
-            cfg[key] = int(value) if isinstance(default, int) and value.lstrip("-").isdigit() else value
+            if isinstance(default, list) and key != "printers":     # allowed_hosts=a.example,b.example
+                cfg[key] = [v.strip() for v in value.split(",") if v.strip()]
+            else:
+                cfg[key] = int(value) if isinstance(default, int) and value.lstrip("-").isdigit() else value
         print(f"saved {config.save(cfg)}")
         return 0
 

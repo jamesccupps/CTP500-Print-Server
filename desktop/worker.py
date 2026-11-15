@@ -24,6 +24,7 @@ start).
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import logging
@@ -42,7 +43,8 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
-from helper_settings import BAMBU_STUDIO as BAMBU, HOME, SERVER, TOKEN  # noqa: E402
+from helper_settings import BAMBU_STUDIO as BAMBU, HELPER_TOKEN, HOME, SERVER, TOKEN  # noqa: E402
+from ctp500 import gcode  # noqa: E402   (no numpy: this process stays small)
 
 BBL = os.path.join(os.path.dirname(BAMBU), "resources", "profiles", "BBL")
 
@@ -256,29 +258,21 @@ def _set(profile: dict, key: str, value) -> None:
 LITHO_PROCESS = {"sparse_infill_density": "100%", "sparse_infill_pattern": "zig-zag", "wall_loops": 1}
 
 
-def check_gcode(gcode: str) -> None:
-    """Refuse G-code that isn't safe to hand over: the A1 mini's own start must be there, and every extruding move
-    between the start and end blocks must stay on the 180 x 180 bed (its own time-lapse G-code parks the head at
-    X-13 to take a frame: travel, allowed), with Z never below 0."""
+def check_gcode(text: str) -> None:
+    """Refuse G-code that isn't safe to hand over: the A1 mini's own start must be there, and the printing part must
+    stay on its bed (gcode.check_gcode, which the server runs again on what it's sent)."""
     with open(os.path.join(BBL, "machine", "Bambu Lab A1 mini 0.4 nozzle template machine_start_gcode.json"),
               encoding="utf-8") as fh:
         start = json.load(fh)["machine_start_gcode"]
     markers = [l.strip() for l in start.splitlines()
                if l.strip().startswith(("M1002", "G29.2", "M970", "M975")) and "{" not in l][:6]
-    missing = [m for m in markers if m not in gcode]
+    missing = [m for m in markers if m not in text]
     if not markers or missing:
         raise RuntimeError(f"not the A1 mini's start G-code (missing {missing[:2]})")
-    if "; MACHINE_START_GCODE_END" not in gcode or "; MACHINE_END_GCODE_START" not in gcode:
-        raise RuntimeError("no start/end markers in the G-code")
-    body = gcode.split("; MACHINE_START_GCODE_END", 1)[1].split("; MACHINE_END_GCODE_START", 1)[0]
-    moves = [l for l in body.splitlines() if re.match(r"^G1 (?=.*X)(?=.*Y)(?=.*E\.?\d)", l)]
-    if not moves:
-        raise RuntimeError("no printing moves")
-    xs = [float(re.search(r"X(-?[\d.]+)", l).group(1)) for l in moves]
-    ys = [float(re.search(r"Y(-?[\d.]+)", l).group(1)) for l in moves]
-    zs = [float(v) for v in re.findall(r"^G[01] .*?Z(-?[\d.]+)", body, re.M)]
-    if min(xs) < 0 or max(xs) > 180 or min(ys) < 0 or max(ys) > 180 or (zs and min(zs) < 0):
-        raise RuntimeError(f"moves off the bed: X {min(xs)}..{max(xs)} Y {min(ys)}..{max(ys)}")
+    try:
+        gcode.check_gcode(text)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
 
 
 def job_slice(data: bytes, params: dict) -> tuple[bytes, dict]:
@@ -351,6 +345,7 @@ def _request(path: str, data: bytes | None = None, headers: dict | None = None, 
                                  method="POST" if data is not None else "GET")
     if TOKEN:
         req.add_header("Authorization", "Bearer " + TOKEN)
+    req.add_header("X-Helper-Token", HELPER_TOKEN)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -360,34 +355,60 @@ gpu: Gpu | None = None
 
 def poll(kinds: list[str]) -> None:
     """One long-poll loop for these kinds of job (quick and slow jobs poll separately, so a 30 s slice never holds
-    up a 0.1 s drawing). Drawings and face sharpening go to the GPU process, slices run here."""
+    up a 0.1 s drawing). Drawings and face sharpening go to the GPU process, slices run here. Nothing ends it: a
+    thread that died would leave the helper looking alive while the server counts it as gone."""
+    refused = False
     while True:
         try:
-            with _request(f"/api/helper/next?kinds={','.join(kinds)}&name={os.environ.get('COMPUTERNAME', 'PC')}",
-                          timeout=40) as res:
-                if res.status == 204:
-                    continue
-                job_id, kind = res.headers["X-Job-Id"], res.headers["X-Job-Kind"]
-                params = json.loads(res.headers.get("X-Job-Params") or "{}")
-                data = res.read()
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            log.info("print server not reachable (%s); retrying", exc)
+            _poll_once(kinds)
+            refused = False
+        except urllib.error.HTTPError as exc:
+            with exc:
+                try:
+                    reason = json.loads(exc.read())["error"]
+                except Exception:
+                    reason = str(exc)
+            if exc.code in (401, 403):          # say it once, not every minute
+                if not refused:
+                    log.error("the print server won't give this helper jobs (%s): %s", exc.code, reason)
+                refused = True
+                time.sleep(60)
+            else:
+                log.info("print server answered %s (%s); retrying", exc.code, reason)
+                time.sleep(10)
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            log.info("print server not reachable (%s); retrying", exc)       # off, restarting, mid-answer
             time.sleep(10)
-            continue
-        t = time.perf_counter()
-        headers = {}
-        try:
-            out, meta = gpu.run(kind, data, params) if kind in GPU_JOBS else JOBS[kind](data, params)
-            headers["X-Job-Meta"] = json.dumps(meta)
-            log.info("%s %s done in %.2f s %s", kind, job_id, time.perf_counter() - t, meta)
-        except Exception as exc:
-            out = b""
-            headers["X-Job-Error"] = str(exc).encode("ascii", "replace").decode()[:300]
-            log.exception("%s %s failed", kind, job_id)
-        try:
-            _request(f"/api/helper/result/{job_id}", out, headers, timeout=60).close()
-        except (urllib.error.URLError, OSError) as exc:
-            log.warning("couldn't send the result of %s: %s", job_id, exc)
+        except Exception:
+            log.exception("polling failed; retrying")
+            time.sleep(10)
+
+
+def _poll_once(kinds: list[str]) -> None:
+    """Wait for one job (up to ~25 s), run it and send back the result or the error."""
+    with _request(f"/api/helper/next?kinds={','.join(kinds)}&name={os.environ.get('COMPUTERNAME', 'PC')}",
+                  timeout=40) as res:
+        if res.status == 204:
+            return
+        job_id, kind = res.headers["X-Job-Id"], res.headers["X-Job-Kind"]
+        params = json.loads(res.headers.get("X-Job-Params") or "{}")
+        data = res.read()
+    t = time.perf_counter()
+    headers = {}
+    try:
+        out, meta = gpu.run(kind, data, params) if kind in GPU_JOBS else JOBS[kind](data, params)
+        headers["X-Job-Meta"] = json.dumps(meta)
+        log.info("%s %s done in %.2f s %s", kind, job_id, time.perf_counter() - t, meta)
+    except Exception as exc:
+        out = b""
+        # one line: a header can't hold line breaks (onnxruntime's and Bambu Studio's messages have them)
+        message = " ".join(str(exc).split()) or type(exc).__name__
+        headers["X-Job-Error"] = message.encode("ascii", "replace").decode()[:300]
+        log.exception("%s %s failed", kind, job_id)
+    try:
+        _request(f"/api/helper/result/{job_id}", out, headers, timeout=60).close()
+    except Exception as exc:
+        log.warning("couldn't send the result of %s: %s", job_id, exc)
 
 
 def main() -> None:
@@ -399,6 +420,9 @@ def main() -> None:
     if not SERVER:
         log.error("no print server: set \"server\" in %s (see helper.example.json)", os.path.join(HERE, "helper.json"))
         sys.exit(1)
+    if not HELPER_TOKEN:
+        log.error("no helper token: on the print server run python -m ctp500 helper-token and put it in %s as "
+                  "\"helper_token\" (or run install.ps1 -HelperToken ...)", os.path.join(HERE, "helper.json"))
     global gpu
     os.environ.setdefault("CTP500_MODELS", os.path.join(os.path.dirname(HERE), "models"))
     # numpy's OpenBLAS committed ~370 MB of buffers for its 12 threads at import; the GPU process's numpy work is

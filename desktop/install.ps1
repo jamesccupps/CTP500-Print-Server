@@ -1,9 +1,11 @@
 # Sets up the CTP500 PC helper (worker.py) on Windows and starts it at logon. Safe to run again (to update too).
 #
-#   powershell -ExecutionPolicy Bypass -File desktop\install.ps1 -Server http://raspberrypi.local:8500
+#   powershell -ExecutionPolicy Bypass -File desktop\install.ps1 -Server http://raspberrypi.local:8500 -HelperToken <t>
 #
-# It writes desktop\helper.json (the print server's address; add "token" there if the server has one), makes the
-# helper's own Python in -HelperHome (a few GB with an NVIDIA card: put it on a roomy drive), installs what it needs,
+# The helper token: on the print server, python -m ctp500 helper-token (pi/install.sh prints the whole line).
+# It writes desktop\helper.json (the print server's address and helper token; add "token" there if the server has
+# one), makes the helper's own Python in -HelperHome (a few GB with an NVIDIA card: put it on a roomy drive), installs
+# what it needs,
 # downloads the AI models and adds the scheduled task "CTP500 helper" (at logon, no window, below-normal priority,
 # restarted if it stops). Needs Python 3.10-3.12 from python.org (the "py" launcher) or uv.
 #   -Cpu      no NVIDIA graphics card (or skip the 3 GB of CUDA): drawings run on the processor, still faster than a Pi
@@ -12,6 +14,7 @@
 
 param(
     [string]$Server,
+    [string]$HelperToken,
     [string]$HelperHome,
     [switch]$Cpu,
     [switch]$NoTask
@@ -30,6 +33,9 @@ if (Test-Path $settings) {
     $changed = $true
 }
 if ($HelperHome -and $cfg.home -ne $HelperHome) { $cfg | Add-Member home $HelperHome -Force; $changed = $true }
+if ($HelperToken -and $cfg.helper_token -ne $HelperToken) {
+    $cfg | Add-Member helper_token $HelperToken -Force; $changed = $true
+}
 if ($changed) {
     # no byte-order mark: Windows PowerShell's utf8 adds one
     [IO.File]::WriteAllText($settings, ($cfg | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
@@ -43,6 +49,10 @@ try {
     Write-Output "Print server answers at $($cfg.server)"
 } catch {
     Write-Warning "Can't reach $($cfg.server) right now; the helper keeps trying once it runs."
+}
+if (-not $cfg.helper_token) {
+    Write-Warning ("No helper token: the server won't give this helper jobs. On the print server run " +
+                   "'python -m ctp500 helper-token', then run this again with -HelperToken <it>.")
 }
 
 # ---- Python

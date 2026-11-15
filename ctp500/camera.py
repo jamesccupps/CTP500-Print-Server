@@ -47,11 +47,15 @@ class CameraGallery:
             raise ValueError("send the photo as the request body")
         try:
             with Image.open(io.BytesIO(data)) as img:
-                fmt = img.format
+                fmt, size = img.format, img.size
                 img.verify()
         except Exception:
             raise ValueError("that isn't a picture the server can read") from None
         if fmt != "JPEG":
+            from .render import MAX_PICTURE_PIXELS     # it's decoded in full to be stored as a JPEG
+            if size[0] * size[1] > MAX_PICTURE_PIXELS:
+                raise ValueError(f"the picture is too big ({size[0]} x {size[1]}); "
+                                 f"the limit is {MAX_PICTURE_PIXELS // 1_000_000} megapixels")
             with Image.open(io.BytesIO(data)) as img:
                 out = io.BytesIO()
                 ImageOps.exif_transpose(img).convert("RGB").save(out, "JPEG", quality=92)

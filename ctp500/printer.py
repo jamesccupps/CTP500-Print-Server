@@ -18,6 +18,15 @@ from .transport import BluetoothTransport, Cancelled, SimulatedTransport, Transp
 
 DIALECTS = ("auto", "cat", "escpos", "phomemo")
 LINE_DOTS = 32  # "feed" counts text lines of about 4 mm, in both CTP500 dialects
+MAX_FEED_LINES = 40   # ~16 cm a call: one request can't run out a whole roll
+
+
+def feed_lines(lines) -> int:
+    """A feed asked for (prints and the feed call): 0 to MAX_FEED_LINES, else ValueError."""
+    n = max(0, int(lines))
+    if n > MAX_FEED_LINES:
+        raise ValueError(f"feed is at most {MAX_FEED_LINES} lines (about {MAX_FEED_LINES * 4 // 10} cm) at a time")
+    return n
 
 
 class PrinterNotReady(TransportError):
@@ -216,6 +225,7 @@ class Printer:
     def print_image(self, bw: Image.Image, darkness=None, feed: int = 2, copies: int = 1,
                     cancel: threading.Event | None = None, progress=None) -> None:
         copies = max(1, min(20, int(copies)))
+        feed = max(0, min(MAX_FEED_LINES, int(feed)))
         with self.lock:
             self.connect()
             job = self._job(bw, darkness, feed)
@@ -286,6 +296,7 @@ class Printer:
                 raise PrinterNotReady(blocking)
 
     def feed(self, lines: int = 3) -> None:
+        lines = max(0, min(MAX_FEED_LINES, int(lines)))
         with self.lock:
             self.connect()
             try:

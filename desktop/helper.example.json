@@ -1,6 +1,7 @@
 {
   "server": "http://raspberrypi.local:8500",
   "token": "",
+  "helper_token": "from the print server: python -m ctp500 helper-token",
   "home": "D:\\ctp500-helper",
   "bambu_studio": "C:\\Program Files\\Bambu Studio\\bambu-studio.exe"
 }

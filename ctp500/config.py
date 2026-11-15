@@ -17,6 +17,13 @@ DEFAULTS = {
     "host": "0.0.0.0",
     "port": 8500,
     "token": "",            # when set, the API wants "Authorization: Bearer <token>" (or ?token=)
+    # the PC helper's own secret (X-Helper-Token): made by the server on its first start, shown by
+    # `python -m ctp500 helper-token`, copied into the helper's helper.json
+    "helper_token": "",
+    # more names the server answers to besides IP addresses, one-word names (raspberrypi, a Tailscale name),
+    # *.local, *.home.arpa, *.internal and *.ts.net, e.g. ["printer.example.com"]; others get 403 (a web page
+    # pointing its own name at your server can't use it)
+    "allowed_hosts": [],
     "darkness": "normal",
     "photo_look": "punchy",  # photo tones: punchy (picked on paper, 2026-10-30) or even (measured, prints at light)
     "feed": 2,              # ~4 mm lines fed after the bottom padding: about the head-to-tear-bar distance
@@ -61,10 +68,13 @@ def load(path: str | None = None) -> dict:
         if not isinstance(data, dict):
             raise ValueError(f"{path} should hold a JSON object")
         cfg.update({k: v for k, v in data.items() if not k.startswith("_")})
+    from_env = {}           # key -> its value before the environment's: save() writes that one back
     for key in ("printer", "server", "token"):
         env = os.environ.get(f"CTP500_{key.upper()}")
         if env:
+            from_env[key] = (cfg[key], env)
             cfg[key] = env
+    cfg["_env"] = from_env
     if not cfg["data_dir"]:
         cfg["data_dir"] = os.path.join(config_dir(), "data")
     cfg["_path"] = path
@@ -120,12 +130,35 @@ def printer_entries(cfg: dict) -> list[dict]:
 def save(cfg: dict, path: str | None = None) -> str:
     path = path or cfg.get("_path") or default_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = {k: v for k, v in cfg.items() if not k.startswith("_") and DEFAULTS.get(k) != v}
+    values = dict(cfg)
+    for key, (before, env) in (cfg.get("_env") or {}).items():
+        if values.get(key) == env:          # given by the environment (often to keep a token out of files)
+            values[key] = before
+    data = {k: v for k, v in values.items() if not k.startswith("_") and DEFAULTS.get(k) != v}
     if data.get("data_dir") == os.path.join(config_dir(), "data"):  # filled in by load(), not chosen
         del data["data_dir"]
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    # only its owner can read it: it can hold the tokens
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)
     return path
+
+
+def helper_token(cfg: dict) -> str:
+    """The PC helper's secret, made (and saved, when the settings came from a file) the first time it's asked for."""
+    if not cfg.get("helper_token"):
+        import secrets
+        cfg["helper_token"] = secrets.token_urlsafe(24)
+        if cfg.get("_path"):
+            try:    # only this key changes in the file (not a --port given for this run, say)
+                on_disk = load(cfg["_path"])
+                on_disk["helper_token"] = cfg["helper_token"]
+                save(on_disk)
+            except (OSError, ValueError) as exc:
+                import sys
+                print(f"warning: couldn't save the helper token to {cfg['_path']}: {exc}", file=sys.stderr)
+    return str(cfg["helper_token"])

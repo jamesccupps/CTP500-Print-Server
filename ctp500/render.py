@@ -18,6 +18,7 @@ import base64
 import binascii
 import datetime as _dt
 import io
+import os
 import re
 
 from PIL import Image, ImageDraw, ImageOps
@@ -29,6 +30,10 @@ NEAREST = getattr(Image, "Resampling", Image).NEAREST
 ROTATE_270 = getattr(Image, "Transpose", Image).ROTATE_270
 
 MAX_HEIGHT = 20000          # ~2.5 m of paper; stops a runaway document
+# Limits checked before anything is drawn, so one request can't make the server allocate gigabytes or spend minutes
+MAX_TEXT = 20000            # characters in any one text option of a block
+MAX_BLOCKS = 500            # blocks in a print, items in a list
+MAX_PICTURE_PIXELS = 40_000_000   # a picture that isn't a JPEG (those are decoded scaled down)
 try:
     import numpy  # noqa: F401  (the picture styles need it)
     DEFAULT_PICTURE_STYLE = "photo"
@@ -76,10 +81,20 @@ def _z(ctx: dict, value) -> int:
     return max(0, round(float(value) * ctx["s"]))
 
 
-def _font(block: dict, ctx: dict, size: int | None = None, bold: bool | None = None):
+def _family(block: dict, ctx: dict) -> str:
+    """A block's font: sans, serif or mono (other names print in sans). A .ttf/.otf file works only from the
+    command line (allow_files), like an image's path: over HTTP it would make the server open any path given."""
     family = str(block.get("font") or "sans")
+    if family in fonts.FAMILIES or ctx["allow_files"]:
+        return family
+    if os.path.splitext(family)[1].lower() in (".ttf", ".otf", ".ttc") or "/" in family or "\\" in family:
+        raise RenderError(f"a font file only works from the command line; use {', '.join(fonts.FAMILIES)}")
+    return "sans"
+
+
+def _font(block: dict, ctx: dict, size: int | None = None, bold: bool | None = None):
     size = min(400, int(size or block.get("size") or DEFAULT_SIZE))      # 400 on the CTP500, as before
-    return fonts.load(family, _d(ctx, size), bool(block.get("bold") if bold is None else bold))
+    return fonts.load(_family(block, ctx), _d(ctx, size), bool(block.get("bold") if bold is None else bold))
 
 
 def _px(font) -> int:
@@ -97,6 +112,9 @@ def _line_height(font, spacing: float) -> int:
 
 def wrap(text: str, font, width: int) -> list[str]:
     """Word-wrap to a pixel width; words longer than a line are broken by character."""
+    # a broken word is measured at most this many characters at a time (twice what fits of the narrowest letter):
+    # measuring the whole rest of a 20,000-letter word for every line took seconds
+    cap = max(2, int(2 * width / max(1.0, font.getlength("i"))) + 1)
     lines: list[str] = []
     for para in text.split("\n"):
         if not para.strip():
@@ -113,12 +131,23 @@ def wrap(text: str, font, width: int) -> list[str]:
             if current.strip():
                 lines.append(current.rstrip())
             current = "" if word.isspace() else word
-            while current and font.getlength(current) > width:
-                cut = len(current)
-                while cut > 1 and font.getlength(current[:cut]) > width:
-                    cut -= 1
-                lines.append(current[:cut])
-                current = current[cut:]
+            last = 0
+            while current and (len(current) > cap or font.getlength(current) > width):
+                top = min(len(current) - 1, cap)    # the longest start that fits (at least one character)
+                if 0 < last <= top and font.getlength(current[:last]) <= width and \
+                        (last == top or font.getlength(current[:last + 1]) > width):
+                    lo = last                       # the line before held as many: usual for a broken word
+                else:
+                    lo, hi = 1, top
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if font.getlength(current[:mid]) <= width:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                last = lo
+                lines.append(current[:lo])
+                current = current[lo:]
         lines.append(current.rstrip())
     return lines
 
@@ -137,8 +166,20 @@ def _draw_lines(draw: ImageDraw.ImageDraw, lines: list[str], font, fake_bold: bo
         draw.text((x, y0 + i * line_h), line, font=font, fill=fill, stroke_width=stroke, stroke_fill=fill)
 
 
+def _limit(ctx: dict) -> int:
+    return round(MAX_HEIGHT * ctx["s"])
+
+
+def _too_long(ctx: dict, dots: float, what: str = "print") -> RenderError:
+    mm = dots / (DOTS_PER_MM * ctx["s"])
+    return RenderError(f"{what} would be {mm / 1000:.1f} m long; the limit is about 2.5 m")
+
+
 def _strip(ctx: dict, height: int, color: int = PAPER) -> Image.Image:
-    return Image.new("L", (ctx["W"], max(1, int(height))), color)
+    height = max(1, int(height))
+    if height > _limit(ctx):        # before allocating it: a huge thickness or padding would ask for gigabytes
+        raise _too_long(ctx, height)
+    return Image.new("L", (ctx["W"], height), color)
 
 
 # ---------------------------------------------------------------- blocks
@@ -184,9 +225,13 @@ def _decode_image(block: dict, ctx: dict) -> Image.Image:
             except (binascii.Error, ValueError) as exc:
                 raise RenderError(f"image data isn't valid base64: {exc}") from None
         try:
-            return Image.open(io.BytesIO(data))
+            img = Image.open(io.BytesIO(data))
         except Exception as exc:
             raise RenderError(f"couldn't read the image: {exc}") from None
+        if img.format != "JPEG" and img.width * img.height > MAX_PICTURE_PIXELS:
+            raise RenderError(f"the picture is too big ({img.width} x {img.height}); "
+                              f"the limit is {MAX_PICTURE_PIXELS // 1_000_000} megapixels")
+        return img
     path = block.get("path")
     if path:
         if not ctx["allow_files"]:
@@ -236,6 +281,11 @@ def _image(block: dict, ctx: dict) -> Image.Image:
         scale=ctx["s"],
     )
     w, h = (img.height, img.width) if rotate % 180 == 90 else img.size
+    # how long it would print, before it's scaled and dithered (a long thin picture at the paper's width)
+    along = ctx["W"] * w / h if block.get("sideways") and w > h else \
+        min(ctx["W"], _d(ctx, int(block.get("width", LAYOUT_WIDTH)))) * h / max(1, w)
+    if along > _limit(ctx):
+        raise _too_long(ctx, along, "the picture")
     try:
         if block.get("sideways") and w > h:
             return _sideways(img, w / h, options, framed, str(block.get("caption", "")), ctx, border, pad)
@@ -454,7 +504,7 @@ def _banner(block: dict, ctx: dict) -> Image.Image:
     text = expand(str(block.get("text", "")), ctx["now"]).replace("\n", " ").strip()
     if not text:
         raise RenderError("banner block needs 'text'")
-    family = str(block.get("font") or "sans")
+    family = _family(block, ctx)
     bold = bool(block.get("bold", True))
     W = ctx["W"]
     avail = W - 2 * ctx["margin"]
@@ -471,6 +521,8 @@ def _banner(block: dict, ctx: dict) -> Image.Image:
     box = font.getbbox(text)
     w, h = box[2] - box[0], box[3] - box[1]
     pad = _d(ctx, 16)
+    if w + 2 * pad > _limit(ctx):      # it runs along the paper: its width is the print's length
+        raise _too_long(ctx, w + 2 * pad, "the banner")
     canvas = Image.new("L", (w + 2 * pad, W), PAPER)
     draw = ImageDraw.Draw(canvas)
     y = (W - h) // 2 - box[1]
@@ -493,11 +545,23 @@ RENDERERS = {
 }
 
 
+def _check_size(block: dict, kind: str) -> None:
+    """RenderError when a block's text or list is beyond what a print can hold (MAX_TEXT, MAX_BLOCKS)."""
+    for key, value in block.items():
+        if isinstance(value, str) and len(value) > MAX_TEXT and not (kind == "image" and key == "data"):
+            raise RenderError(f"'{key}' is longer than {MAX_TEXT} characters")
+    items = block.get("items")
+    if isinstance(items, list):
+        if len(items) > MAX_BLOCKS:
+            raise RenderError(f"a list can have up to {MAX_BLOCKS} items")
+        for item in items:
+            text = item.get("text", "") if isinstance(item, dict) else item
+            if len(str(text)) > MAX_TEXT:
+                raise RenderError(f"an item is longer than {MAX_TEXT} characters")
+
+
 def _stack(ctx: dict, parts: list[Image.Image], gap: int) -> Image.Image:
     height = sum(p.height for p in parts) + gap * max(0, len(parts) - 1)
-    limit = round(MAX_HEIGHT * ctx["s"])
-    if height > limit:
-        raise RenderError(f"print is {height} dots long; the limit is {limit} (about 2.5 m)")
     out = _strip(ctx, height)
     y = 0
     for p in parts:
@@ -603,7 +667,11 @@ def render(doc, allow_files: bool = False, now: _dt.datetime | None = None,
            "now": now or _dt.datetime.now(), "level": level,
            "look": doc.get("photo_look") if doc.get("photo_look") in PHOTO_LOOKS else "punchy"}
     ctx["margin"] = _z(ctx, max(0, min(80, int(doc.get("margin", 6)))))
+    if len(doc["blocks"]) > MAX_BLOCKS:
+        raise RenderError(f"a print can have up to {MAX_BLOCKS} blocks")
+    gap = _z(ctx, max(0, int(doc.get("gap", 6))))
     parts = []
+    length = 0
     for i, block in enumerate(doc["blocks"]):
         if not isinstance(block, dict):
             block = {"type": "text", "text": str(block)}
@@ -612,14 +680,19 @@ def render(doc, allow_files: bool = False, now: _dt.datetime | None = None,
         if fn is None:
             raise RenderError(f"block {i + 1}: unknown type '{kind}' (known: {', '.join(BLOCK_TYPES)})")
         try:
-            parts.append(fn(block, ctx))
+            _check_size(block, kind)
+            part = fn(block, ctx)
         except RenderError as exc:
             raise RenderError(f"block {i + 1} ({kind}): {exc}") from None
         except (TypeError, ValueError) as exc:
             raise RenderError(f"block {i + 1} ({kind}): bad option ({exc})") from None
+        length += part.height + (gap if parts else 0)
+        if length > _limit(ctx):        # stop at the block that passes it, not after drawing them all
+            raise _too_long(ctx, length)
+        parts.append(part)
     if not parts:
         raise RenderError("nothing to print")
-    page = _stack(ctx, parts, gap=_z(ctx, max(0, int(doc.get("gap", 6)))))
+    page = _stack(ctx, parts, gap=gap)
     top, bottom = (_mm_to_dots(doc.get(key, 0), paper) for key in ("padding_top_mm", "padding_bottom_mm"))
     if top or bottom:
         page = _stack(ctx, [p for p in (_strip(ctx, top) if top else None, page,

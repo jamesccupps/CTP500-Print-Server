@@ -22,10 +22,14 @@ Needs Python 3.10–3.12 from [python.org](https://www.python.org/downloads/wind
 [uv](https://docs.astral.sh/uv/)). In PowerShell, from this repo:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File desktop\install.ps1 -Server http://raspberrypi.local:8500
+powershell -ExecutionPolicy Bypass -File desktop\install.ps1 -Server http://raspberrypi.local:8500 -HelperToken <token>
 ```
 
-It saves the server's address in `desktop\helper.json`, makes the helper's own Python environment, installs what
+The helper token is the server's way of knowing it's your helper (only it is sent the photos to work on). The Pi's
+installer prints this whole line with it filled in; to see it again, on the Pi:
+`cd ~/ctp500 && python3 -m ctp500 helper-token`.
+
+It saves the server's address and the helper token in `desktop\helper.json`, makes the helper's own Python environment, installs what
 it needs (with an NVIDIA card: PyTorch's CUDA libraries + onnxruntime-gpu, about 3 GB, once), downloads the AI
 models and adds the scheduled task **CTP500 helper** (starts at logon, no window, below-normal priority). The
 server's status shows it: `GET /api/status` → `"helper": {"online": true, ...}`.
@@ -41,5 +45,5 @@ the repo. The log is `<home>\worker.log`. To remove it: `Unregister-ScheduledTas
 the home folder.
 
 **Ready to print** needs [Bambu Studio](https://bambulab.com/en/download/studio) installed in its default folder (or
-set `"bambu_studio"` in helper.json). Every sliced file is checked before it's handed over: the A1 mini's own start
-G-code must be there and every extruding move must stay on its 180 x 180 mm bed.
+set `"bambu_studio"` in helper.json). Every sliced file is checked before it's handed over (and again on the print
+server): the A1 mini's own start G-code must be there and every extruding move must stay on its 180 x 180 mm bed.

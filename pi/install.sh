@@ -81,10 +81,13 @@ systemctl --no-pager --lines=3 status ctp500 | sed -n '1,3p;/ctp500 0/p'
 PORT=$(python3 -c "from ctp500 import config; print(config.load()['port'])")
 NOW=$(python3 -c "from ctp500 import config; print(config.load()['printer'])")
 TOKEN=$(python3 -c "from ctp500 import config; print('yes' if config.load()['token'] else '')")
+HELPER_TOKEN=$(python3 -m ctp500 helper-token)
 IP=$(hostname -I | awk '{print $1}')
 echo
 echo "Ready. Open the web app on any phone or computer on this network:"
 echo "    http://$IP:$PORT    (or http://$(hostname).local:$PORT)"
 [ "$NOW" = sim ] && echo "Printer: simulated (prints show up in History). Run this again with the printer on to use it."
 [ -z "$TOKEN" ] && echo "Anyone on your network can print. To require a token: see \"Lock it down\" in README.md."
+echo "A Windows PC can take the heavy jobs (desktop/README.md). Set it up there with this server's helper token:"
+echo "    powershell -ExecutionPolicy Bypass -File desktop\\install.ps1 -Server http://$IP:$PORT -HelperToken $HELPER_TOKEN"
 echo "Logs: journalctl -u ctp500 -f"

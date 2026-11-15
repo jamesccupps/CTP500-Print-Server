@@ -9,12 +9,25 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
+from unittest import mock
 
 from PIL import Image, ImageDraw
 
 from ctp500 import catproto, markup, protocol, raster, render, simulate
 from ctp500.printer import make_printer
 from ctp500.server import _title, serve
+
+
+def sliced_3mf(moves: str = "G1 X10 Y10 E.5\nG1 X20 Y30 E.5\n") -> bytes:
+    """A stand-in for a .gcode.3mf from Bambu Studio: the printer's own start and end blocks (relative moves,
+    parking off the bed), and the printing part between them."""
+    text = ("M1002 gcode_claim_action : 2\nG91\nG1 X-30 Z-1\nG90\n; MACHINE_START_GCODE_END\nG1 Z.2\n" + moves +
+            "; MACHINE_END_GCODE_START\nG91\nG1 Z1\nG90\nG1 X-13 Y180\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("Metadata/plate_1.gcode", text)
+    return buf.getvalue()
 
 
 def png_b64(size=(200, 120)) -> str:
@@ -239,6 +252,38 @@ class RenderTests(unittest.TestCase):
         lines = render.wrap("x" * 300, font, 300)
         self.assertGreater(len(lines), 2)
         self.assertTrue(all(font.getlength(line) <= 300 for line in lines))
+        t = time.perf_counter()                 # a 20,000-letter word: each line measured, not the whole rest
+        lines = render.wrap("x" * 19000 + " end", font, 300)
+        self.assertLess(time.perf_counter() - t, 5)
+        self.assertEqual("".join(lines).replace(" ", ""), "x" * 19000 + "end")
+        self.assertTrue(all(font.getlength(line) <= 300 for line in lines))
+
+    def test_limits_hold_before_drawing(self):
+        t = time.perf_counter()
+        for block in ({"type": "line", "thickness": 10 ** 9}, {"type": "line", "padding": 10 ** 9},
+                      {"type": "text", "text": "x", "padding": 10 ** 9}, {"type": "text", "text": "x", "spacing": 10 ** 7},
+                      {"type": "banner", "text": "W" * 19000}, {"type": "text", "text": "x" * 20001},
+                      {"type": "checklist", "items": ["x"] * 501}, {"type": "list", "items": ["x" * 20001]}):
+            with self.assertRaises(render.RenderError, msg=str(block)[:60]):
+                render.render({"blocks": [block]})
+        with self.assertRaisesRegex(render.RenderError, "up to 500 blocks"):
+            render.render({"blocks": [{"type": "text", "text": "x"}] * 501})
+        tall = Image.new("L", (64, 60000), 255)                 # 64 x 60,000 would print 360,000 dots long
+        buf = io.BytesIO()
+        tall.save(buf, "PNG")
+        with self.assertRaisesRegex(render.RenderError, "the picture would be"):
+            render.render({"blocks": [{"type": "image", "data": base64.b64encode(buf.getvalue()).decode()}]})
+        self.assertLess(time.perf_counter() - t, 20)
+
+    def test_font_files_work_from_the_command_line(self):
+        from ctp500 import fonts
+        path = fonts.font_path("serif") or fonts.font_path("sans")
+        if not path:
+            self.skipTest("no font files on this machine")
+        doc = {"blocks": [{"type": "text", "text": "x", "font": path}]}
+        self.assertEqual(render.render(doc, allow_files=True).width, protocol.WIDTH)
+        with self.assertRaisesRegex(render.RenderError, "only works from the command line"):
+            render.render(doc)
 
     def test_titles_hide_wifi_passwords(self):
         self.assertEqual(_title({"blocks": [{"type": "qr", "data": "WIFI:T:WPA;S:Home;P:secret;;"}]}), "Wi-Fi QR (Home)")
@@ -458,16 +503,19 @@ class ServerTests(unittest.TestCase):
 
     def _fake_helper(self, kinds, answer, stop):
         """A stand-in for the PC helper (desktop/worker.py): long-polls and answers with answer(kind, data, params)."""
+        mine = {"X-Helper-Token": self.httpd.service.cfg["helper_token"]}
+
         def run():
             while not stop.is_set():
                 try:
-                    code, body, headers = self.call(f"/api/helper/next?kinds={kinds}&name=test&wait=1")
+                    code, body, headers = self.call(f"/api/helper/next?kinds={kinds}&name=test&wait=1", headers=mine)
                 except OSError:
                     return                                              # the test's server has stopped
                 if code != 200:
                     continue
                 out, meta = answer(headers["X-Job-Kind"], body, json.loads(headers["X-Job-Params"]))
-                self.call(f"/api/helper/result/{headers['X-Job-Id']}", out, headers={"X-Job-Meta": json.dumps(meta)})
+                self.call(f"/api/helper/result/{headers['X-Job-Id']}", out,
+                          headers={"X-Job-Meta": json.dumps(meta), **mine})
         threading.Thread(target=run, daemon=True).start()
         for _ in range(50):                                            # until the Pi has seen it
             if json.loads(self.call("/api/status")[1])["helper"]["online"]:
@@ -483,12 +531,14 @@ class ServerTests(unittest.TestCase):
         self.assertIn("turn the PC on", json.loads(body)["error"])
         self.assertEqual(self.call(f"/api/camera/litho/{name}.png?shape=figurine")[0], 400)   # not a shape (any more)
         seen = {}
+        good = sliced_3mf()
+        reply = {"slice": sliced_3mf("G1 X10 Y10 E.5\nG1 X250 Y20 E.5\n")}   # off the bed: refused, not cached
 
         def answer(kind, data, params):
             seen[kind] = params
             if kind == "slice":                                         # the Pi's own STL (binary, counted)
                 self.assertEqual(len(data), 84 + 50 * int.from_bytes(data[80:84], "little"))
-                return b"PK-sliced", {"minutes": 18}
+                return reply["slice"], {"minutes": 18}
             return data, {}                                             # draw: hand the picture back (RGB)
         from ctp500 import camera, render
         self.assertIsNone(render.SHARPEN(Image.new("RGB", (64, 48))))            # PC off: photos as taken
@@ -501,11 +551,15 @@ class ServerTests(unittest.TestCase):
         self.assertEqual((status["online"], status["name"], status["kinds"]),
                          (True, "test", ["draw", "restore", "slice"]))
         code, body, _ = self.call(f"/api/camera/litho/{name}.3mf?shape=flat&size=80")   # (relief needs the models)
-        self.assertEqual((code, body, seen["slice"]["shape"]), (200, b"PK-sliced", "flat"))
+        self.assertEqual(code, 500)
+        self.assertIn("failed the check: moves off the bed", json.loads(body)["error"])
+        reply["slice"] = good
+        code, body, _ = self.call(f"/api/camera/litho/{name}.3mf?shape=flat&size=80")
+        self.assertEqual((code, body, seen["slice"]["shape"]), (200, good, "flat"))
         sharp = render.SHARPEN(Image.new("RGB", (64, 48), (9, 99, 199)))         # the PC's picture comes back
         self.assertEqual((sharp.size, seen["restore"]), ((64, 48), {"model": "gfpgan_1.4"}))
         code, body, headers = self.call(f"/api/camera/litho/{name}.3mf?size=60&shape=curved")
-        self.assertEqual((code, body), (200, b"PK-sliced"))
+        self.assertEqual((code, body), (200, good))
         self.assertIn('IMG00012-lithophane-curved-60mm.gcode.3mf"', headers["Content-Disposition"])
         self.assertEqual(seen["slice"], {"name": "IMG00012", "size": 60.0, "shape": "curved"})
         from ctp500 import ai
@@ -701,6 +755,90 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.call("/api/status?token=s3cret")[0], 200)
         self.assertEqual(self.call("/api/print/text", b"x", headers={"Authorization": "Bearer s3cret"})[0], 202)
         self.assertEqual(self.call("/")[0], 200)  # the app itself loads, then asks for the token
+
+    def test_unknown_host_names_are_refused(self):
+        # a web page can point its own name at the server (DNS rebinding): only names no page can use are answered
+        for host in ("evil.example:8500", "192.0.2.5.nip.io", "printer.example.com"):
+            self.assertEqual(self.call("/api/status", headers={"Host": host})[0], 403, host)
+            self.assertEqual(self.call("/", headers={"Host": host})[0], 403, host)
+            code, body, _ = self.call("/api/print/text", b"x", headers={"Host": host})
+            self.assertEqual(code, 403, host)
+            self.assertIn("allowed_hosts", json.loads(body)["error"])
+        for host in ("127.0.0.1:8500", "[::1]:8500", "localhost", "raspberrypi:8500", "raspberrypi.local",
+                     "printer-pi.example-net.ts.net", "pi.home.arpa"):
+            self.assertEqual(self.call("/api/status", headers={"Host": host})[0], 200, host)
+        self.stop()
+        self.cfg["allowed_hosts"] = ["Printer.Example.com"]
+        self.start()
+        self.assertEqual(self.call("/api/status", headers={"Host": "printer.example.com:8500"})[0], 200)
+        from ctp500.server import host_allowed
+        self.assertTrue(host_allowed("a.example", "b.example, a.example"))     # `config allowed_hosts=` as text
+        self.assertFalse(host_allowed(":8500"))
+
+    def test_only_the_pc_helper_gets_its_jobs(self):
+        token = self.httpd.service.cfg["helper_token"]
+        self.assertGreater(len(token), 20)
+        for headers in ({}, {"X-Helper-Token": "guess"}):
+            code, body, _ = self.call("/api/helper/next?kinds=draw&wait=0", headers=headers)
+            self.assertEqual(code, 401)
+            self.assertIn("helper-token", json.loads(body)["error"])
+            self.assertEqual(self.call("/api/helper/result/1", b"x", headers=headers)[0], 401)
+        self.assertFalse(json.loads(self.call("/api/status")[1])["helper"]["online"])   # it never counted as one
+        mine = {"X-Helper-Token": token}
+        self.assertEqual(self.call("/api/helper/next?kinds=draw&wait=0", headers=mine)[0], 204)
+        self.assertEqual(self.call("/api/helper/next?kinds=draw&wait=soon", headers=mine)[0], 400)
+
+    def test_feed_is_limited(self):
+        self.assertEqual(self.call("/api/feed?lines=40", b"")[0], 200)
+        code, body, _ = self.call("/api/feed?lines=2000", b"")
+        self.assertEqual(code, 400)
+        self.assertIn("at most 40 lines", json.loads(body)["error"])
+        self.assertEqual(self.call("/api/print/text?feed=500", b"x")[0], 400)
+        self.assertEqual(self.call("/api/print", {"text": "x", "feed": 41})[0], 400)
+        from ctp500.printer import LINE_DOTS, MAX_FEED_LINES
+        for dialect in ("cat", "escpos"):                   # the printer layer holds the limit by itself too
+            folder = os.path.join(self.tmp.name, dialect)
+            make_printer("sim", folder, keep_alive=0, dialect=dialect).feed(100000)
+            paper = os.path.join(folder, "simulated-paper")
+            with Image.open(os.path.join(paper, sorted(os.listdir(paper))[-1])) as fed:
+                self.assertEqual(fed.height, MAX_FEED_LINES * LINE_DOTS, dialect)
+
+    def test_font_files_only_from_the_command_line(self):
+        for block in ({"type": "text", "text": "x", "font": "/usr/share/fonts/x.ttf"},
+                      {"type": "banner", "text": "x", "font": "C:\\Windows\\Fonts\\arial.ttf"},
+                      {"type": "heading", "text": "x", "font": "x.otf"}):
+            code, body, _ = self.call("/api/print", {"blocks": [block]})
+            self.assertEqual(code, 400, block)
+            self.assertIn("command line", json.loads(body)["error"])
+        self.assertEqual(self.call("/api/print/text?font=a.ttf", b"x")[0], 400)
+        self.assertEqual(self.call("/api/print", {"text": "x", "font": "Comic Sans"})[0], 202)   # prints in sans
+
+    def test_big_pictures_and_broken_requests(self):
+        big = Image.new("RGB", (120, 100), "white")
+        buf = io.BytesIO()
+        big.save(buf, "PNG")
+        with mock.patch.object(render, "MAX_PICTURE_PIXELS", 10000):       # 12,000 pixels, not a JPEG
+            code, body, _ = self.call("/api/print/image", buf.getvalue())
+            self.assertEqual(code, 400)
+            self.assertIn("too big", json.loads(body)["error"])
+            self.assertEqual(self.call("/api/camera/upload", buf.getvalue(), headers={"X-Filename": "a.png"})[0], 400)
+            self.assertEqual(self.call("/api/camera/upload", self._jpeg(), headers={"X-Filename": "b.jpg"})[0], 200)
+        with open(os.path.join(self.httpd.service.camera.dir, "IMG00077.jpg"), "wb") as f:
+            f.write(b"\xff\xd8\xff not a whole JPEG")
+        code, body, _ = self.call("/api/camera/thumb/IMG00077.jpg")             # an answer, not a hang-up
+        self.assertEqual(code, 500)
+        self.assertIn("error", json.loads(body))
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=10)
+        try:
+            conn.putrequest("POST", "/api/print/text")
+            conn.putheader("Content-Length", "lots")
+            conn.endheaders()
+            res = conn.getresponse()
+            self.assertEqual(res.status, 400)
+            self.assertIn("Content-Length", json.loads(res.read())["error"])
+        finally:
+            conn.close()
 
     def test_history_survives_restart(self):
         self.call("/api/print/text?wait=1", b"remember me")
@@ -934,6 +1072,56 @@ class LithophaneTests(unittest.TestCase):
         self.assertGreaterEqual(t.min(), litho.RELIEF_BASE_MM * 0.6 - 1e-6)
         png = Image.open(io.BytesIO(litho.relief_preview(t, res, 200)))
         self.assertEqual(png.width, 200)
+
+
+class SlicedFileTests(unittest.TestCase):
+    def test_printing_part_must_stay_on_the_bed(self):
+        from ctp500 import gcode
+        gcode.check_sliced(sliced_3mf())          # the start and end blocks may park off the bed, move relative
+        for moves, why in (("G1 X190 Y10 E.5\n", "off the bed"), ("G1 X10 Y-2 E.5\n", "off the bed"),
+                           ("G1 X10 Y10 E.5\nG1 Z-1\n", "off the bed"), ("G91\nG1 X10 Y10 E.5\n", "relative"),
+                           ("G1 X10 Y10\n", "no printing moves")):
+            with self.assertRaisesRegex(ValueError, why):
+                gcode.check_sliced(sliced_3mf(moves))
+        for bad in (b"PK-sliced", b""):
+            with self.assertRaisesRegex(ValueError, "not a sliced 3MF"):
+                gcode.check_sliced(bad)
+        with self.assertRaisesRegex(ValueError, "start/end markers"):
+            gcode.check_gcode("G1 X10 Y10 E.5\n")
+
+
+class ConfigTests(unittest.TestCase):
+    def test_a_token_from_the_environment_stays_out_of_the_file(self):
+        from ctp500 import config
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            with open(path, "w") as f:
+                json.dump({"token": "from-file", "port": 8600}, f)
+            with mock.patch.dict(os.environ, {"CTP500_TOKEN": "from-env"}):
+                cfg = config.load(path)
+            self.assertEqual(cfg["token"], "from-env")
+            cfg["darkness"] = "dark"                    # a setting changed in the app
+            config.save(cfg)
+            with open(path) as f:
+                saved = json.load(f)
+            self.assertEqual((saved["token"], saved["darkness"], saved["port"]), ("from-file", "dark", 8600))
+            if os.name == "posix":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_the_helper_token_is_made_once_and_saved_alone(self):
+        from ctp500 import config
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            with open(path, "w") as f:
+                json.dump({"port": 8600}, f)
+            cfg = config.load(path)
+            cfg["port"] = 9999                          # serve --port: for this run only
+            token = config.helper_token(cfg)
+            self.assertEqual(config.helper_token(cfg), token)
+            with open(path) as f:
+                saved = json.load(f)
+            self.assertEqual((saved["helper_token"], saved["port"]), (token, 8600))
+            self.assertEqual(config.load(path)["helper_token"], token)
 
 
 class OffloadTests(unittest.TestCase):

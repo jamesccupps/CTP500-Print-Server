@@ -5,12 +5,18 @@ request can print. The server listens on port 8500.
 
 - Print calls answer right away with the job (`202`). Add `?wait=1` to answer after printing (`200`, or `502` with
   the error).
-- Every print call takes `darkness` (`light`, `normal`, `dark`, `darkest`, 0–255, or `auto`), `copies` and `feed`.
+- Every print call takes `darkness` (`light`, `normal`, `dark`, `darkest`, 0–255, or `auto`), `copies` (1–20)
+  and `feed` (0–40 lines of about 4 mm).
 - With [more than one printer](../README.md#a-second-printer-phomemo-m02-pro), every print call also takes
   `printer`: an `id` from `/api/status` (`ctp500`, `m02pro`) or its name. Without it a print goes to the main
   printer. Each printer has its own queue.
 - With a token set (`python3 -m ctp500 config token=...`), send `Authorization: Bearer <token>` or add `?token=`.
-- Browser requests from other web sites are refused, so a page you visit can't print on your printer.
+- Browser requests from other web sites are refused, so a page you visit can't print on your printer. The server
+  only answers to its IP address, one-word names, `.local`, `.home.arpa`, `.internal` and `.ts.net` names and the
+  `allowed_hosts` setting (`403` otherwise), so a page can't point a name of its own at it either.
+- A print can have up to 500 blocks (a list up to 500 items), 20,000 characters in any text, and be up to about
+  2.5 m long; a picture that isn't a JPEG up to 40 megapixels. Font files (`"font": "<path>.ttf"`) work only
+  from the command line; over HTTP, `font` is `sans`, `serif` or `mono`.
 
 ## Printing
 
@@ -20,7 +26,7 @@ request can print. The server listens on port 8500.
 | `POST /api/print/image` | a PNG/JPEG file (`?style=photo\|photoline\|floyd\|atkinson\|threshold\|line\|artist\|sketch\|coloring\|poster\|halftone\|hatch`, `detail=0..1`, `weight=1..3`, `rotate=90`, `brightness`, `contrast`, `width`, `caption`) |
 | `POST /api/print` | a JSON layout (below) |
 | `POST /api/preview` | the same JSON; answers with the PNG it would print, prints nothing |
-| `POST /api/feed?lines=3` | feed paper (`&printer=`) |
+| `POST /api/feed?lines=3` | feed paper, up to 40 lines (`&printer=`) |
 | `GET /api/status` | `printer` (the main one), `printers` (all of them: `id`, `label`, `model`, `width`, `dpi`, `paper_mm`, state), `camera_printer`, queue, version, PC helper |
 | `GET /api/settings`, `POST /api/settings` | padding (`padding_top_mm`, `padding_bottom_mm`, 0–50), `photo_look` (`punchy`/`even`), camera print settings, `camera_printer` (a printer id, or `""` for the main one) |
 | `POST /api/check` | connect to the printer now (`?printer=`) |
@@ -73,6 +79,10 @@ so a layout comes out the same size on either printer; `/api/preview` answers wi
 | `GET /api/camera/litho/<name>.png`, `.stl`, `.3mf` | lithophane preview, 3D model, ready-to-print file (needs the PC helper); `?size=` long side in mm (30–170), `?shape=flat\|curved\|relief` |
 
 ## PC helper
+
+Both calls also need the helper's own token in `X-Helper-Token` (`python3 -m ctp500 helper-token` on the server),
+with or without the general token: only the helper is sent the photos it works on. Ready-to-print files it sends
+back are checked again on the server (every printing move on the A1 mini's bed) before anyone gets them.
 
 | Call | |
 |---|---|
