@@ -22,8 +22,8 @@ jobs:
           - { os: windows-latest, python: "3.12" }
           - { os: ubuntu-latest, python: "3.12", models: true }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -33,7 +33,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: AI models (cached; checked against their SHA-256s)
         if: matrix.models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: models
           key: models-${{ hashFiles('ctp500/ai.py') }}
