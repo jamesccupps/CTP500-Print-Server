@@ -1,0 +1,16 @@
+# Keeps the workflow's actions current, once a month, in one pull request.
+#
+# Python packages are left out on purpose: requirements.txt gives only minimum
+# versions (or none), so pip already installs the newest release, and there is
+# nothing pinned to go stale.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"
