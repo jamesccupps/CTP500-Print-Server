@@ -41,12 +41,21 @@ function withToken(url) {
   return token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url;
 }
 
-function toast(text, kind = "") {
+// action: {label, run}, a button in the message (it then stays longer)
+function toast(text, kind = "", action = null) {
   const el = document.createElement("div");
   el.className = "toast " + kind;
   el.textContent = text;
+  if (action) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "toast-action";
+    b.textContent = action.label;
+    b.onclick = () => { el.remove(); action.run(); };
+    el.append(" ", b);
+  }
   $("#toasts").append(el);
-  setTimeout(() => el.remove(), kind === "error" ? 6000 : 3000);
+  setTimeout(() => el.remove(), action ? 15000 : kind === "error" ? 6000 : 3000);
 }
 
 // ------------------------------------------------------------------ grid
@@ -95,6 +104,7 @@ function render() {
     tile.type = "button";
     tile.className = "tile";
     tile.title = timeLabel(p.taken);
+    tile.dataset.i = i;
     tile.innerHTML = "<img loading='lazy' alt=''>";
     tile.querySelector("img").src = withToken(p.thumb);
     tile.onclick = () => open(i);
@@ -108,14 +118,26 @@ function open(i) {
   state.index = i;
   $("#viewer").hidden = false;
   document.body.classList.add("viewing");
+  setBehind(true);
   show();
+  $("#viewer").focus();
 }
 
 function close() {
   cancelPendingPrint();
+  const i = state.index;
   $("#viewer").hidden = true;
   document.body.classList.remove("viewing");
+  setBehind(false);
   state.index = -1;
+  const tile = $(`.tile[data-i="${i}"]`);      // back where you are in the gallery
+  if (tile) tile.focus();
+}
+
+// While the viewer is open the page behind it is out of reach: Tab stays in the viewer (it walked through every
+// tile first, 2,000 in a big gallery) and a screen reader reads only the viewer.
+function setBehind(off) {
+  for (const el of [$("header.top"), $("#gallery"), $("#camera-fab")]) el.inert = off;
 }
 
 function show() {
@@ -308,25 +330,79 @@ async function sendPrint(p, body) {
   try {
     const { job } = await api(`/api/camera/photo/${encodeURIComponent(p.name)}/print`, { method: "POST", body });
     toast("Printing…");
+    refreshStatus();
     watch(job.id);
   } catch (err) { toast(err.message, "error"); }
 }
 
+// Follows a print until it's out. One the printer can't take yet (no paper, lid open, switched off) waits on the
+// server and goes out once that's fixed, for up to 30 minutes: say so once, then keep following it (this page used
+// to stop after "Printing…" and never say).
 async function watch(id) {
-  for (let i = 0; i < 120; i++) {
-    await new Promise(r => setTimeout(r, 1000));
+  let waitingSaid = false;
+  const until = Date.now() + 35 * 60 * 1000;
+  for (let i = 0; Date.now() < until; i++) {
+    await new Promise(r => setTimeout(r, i < 60 ? 1000 : 5000));
     try {
       const job = await api("/api/jobs/" + id);
       if (job.status === "done") { toast("Printed"); return; }
       if (job.status === "failed") { toast(job.error || "The print failed", "error"); return; }
       if (job.status === "cancelled") return;
+      if (job.status === "waiting" && !waitingSaid) {
+        waitingSaid = true;
+        toast(`Waiting for the printer (${job.error || "not ready"}); it prints once that's fixed.`, "error",
+              { label: "Cancel print", run: () => cancelJobs([id]) });
+        refreshStatus();
+      }
     } catch { /* keep trying */ }
   }
 }
 
+// ------------------------------------------------------------------ printer status
+
+// Shown at the top only while something prints or waits for the printer (also for prints sent from elsewhere, or
+// when this page was opened later). Tapping it while prints wait cancels them. Not asked while the page is hidden.
+let statusTimer = 0;
+let waitingJobs = [];
+async function refreshStatus() {
+  clearTimeout(statusTimer);
+  let busy = false;
+  if (!document.hidden) {
+    try {
+      const queue = (await api("/api/status")).queue || [];
+      waitingJobs = queue.filter(j => j.status === "waiting");
+      busy = queue.length > 0;
+      const pill = $("#status");
+      pill.hidden = !busy;
+      pill.className = "status " + (waitingJobs.length ? "bad" : "busy");
+      $("#status-text").textContent = waitingJobs.length ? "Waiting for the printer" : "Printing…";
+      pill.title = waitingJobs.length ? `${waitingJobs[0].error || "Not ready"}. Tap to cancel.` : "";
+    } catch { /* the server is away: try again later */ }
+  }
+  statusTimer = setTimeout(refreshStatus, busy ? 3000 : 20000);
+}
+
+async function cancelWaiting() {
+  const n = waitingJobs.length;
+  if (!n) return;
+  if (!confirm(n === 1 ? "Cancel the print that's waiting for the printer?"
+                       : `Cancel the ${n} prints that are waiting for the printer?`)) return;
+  cancelJobs(waitingJobs.map(j => j.id));
+}
+
+async function cancelJobs(ids) {
+  for (const id of ids) {
+    try { await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }); }
+    catch (err) { toast(err.message, "error"); return; }
+  }
+  toast(ids.length === 1 ? "Print canceled" : "Prints canceled");
+  setTimeout(refreshStatus, 1500);
+}
+
 async function deleteCurrent() {
   const p = state.photos[state.index];
-  if (!confirm("Delete this photo from the print server? (If it came from the camera, it's still on the camera's card.)")) return;
+  if (!confirm("Delete this photo from the print server, with its prints in History? (If it came from the camera, " +
+               "it's still on the camera's card.)")) return;
   try {
     await api(`/api/camera/photo/${encodeURIComponent(p.name)}/delete`, { method: "POST" });
     state.photos.splice(state.index, 1);
@@ -415,10 +491,15 @@ function init() {
 
   document.addEventListener("keydown", e => {
     if ($("#viewer").hidden) return;
-    if (e.key === "Escape") close();
+    if (e.key === "Escape") { close(); return; }
+    // in a menu or a field the arrows are its own (one press changed the style and the photo, 2026-11-21)
+    if (e.target.closest && e.target.closest("select, input, textarea")) return;
     if (e.key === "ArrowLeft") step(-1);
     if (e.key === "ArrowRight") step(1);
   });
+  $("#status").onclick = cancelWaiting;
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });
+  refreshStatus();
 
   // swipe left/right in the viewer
   let x0 = null;

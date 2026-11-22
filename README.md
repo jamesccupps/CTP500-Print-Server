@@ -120,7 +120,8 @@ of paper".
   printing and text above or below. Line drawings, sketches and coloring pages are drawn by an AI model.
 - **QR code:** a link, text, or a Wi-Fi network your guests can scan. **Banner:** huge letters along the paper.
 - **Templates:** to-do, shopping list, sticky note, daily plan, receipt, label, message, Wi-Fi card.
-- **History:** everything printed, with reprint. **Automate:** copy-paste examples with your server's address.
+- **History:** everything printed, with reprint, and **Cancel** on prints still waiting or printing (also next to
+  the progress bar). **Automate:** copy-paste examples with your server's address.
 - **Settings:** blank paper above and below prints, photo tones (Punchy / Even), and how camera photos print, with
   a live preview of your newest photo.
 
@@ -132,7 +133,8 @@ of paper".
 grouped by day.
 
 - **Preview print** shows exactly what will print (in the camera's style, or pick another); **Print** gives you 3 s
-  to change your mind. **Download**, **Delete**, **Download all** (one zip).
+  to change your mind. If the printer isn't ready, the page says so and shows **Waiting for the printer** at the
+  top (tap it to cancel). **Download**, **Delete** (its prints in History go too), **Download all** (one zip).
 - **Take photo** on a phone opens its camera: the shot uploads and opens one tap from Print. **Upload** (or drop
   files on the page) adds photos from anywhere.
 - **Faces:** small faces are drawn again from a close crop so they get eyes and a mouth; the tones are set so faces
@@ -239,7 +241,8 @@ On a computer with working Bluetooth, `--printer AA:BB:CC:DD:EE:FF` prints direc
 - **Prints come out blank:** the printer speaks the other dialect. `python3 -m ctp500 config protocol=cat` (or
   `escpos`), then `sudo systemctl restart ctp500`.
 - **A print says "Waiting":** out of paper, lid open, or the printer is off or out of range. Fix it and the print
-  goes out by itself (for 30 minutes), or cancel it in History.
+  goes out by itself (for 30 minutes, even if the server restarts meanwhile), or cancel it in History or with
+  **Waiting for the printer** on the Photos page.
 - **No AI styles** (line drawings look like plain edges): `cd ~/ctp500 && .venv/bin/python -m ctp500 models`. The AI
   needs a 64-bit OS.
 - **The M02 Pro doesn't connect:** it must be paired (`add-printer` does that) and not connected to its phone

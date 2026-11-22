@@ -88,7 +88,12 @@ button.primary:not(:disabled):hover { filter: brightness(1.08); }
 @media (max-width: 920px) {
   .layout { grid-template-columns: 1fr; }
   .top { flex-wrap: wrap; padding: 10px 16px; }
-  .top-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
+  .top-actions { margin-left: 0; width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+}
+/* the five header buttons need ~380 px: on narrower phones "Photos" slid off the left edge (2026-11-21) */
+@media (max-width: 420px) {
+  .top-actions { justify-content: space-between; gap: 0; }
+  .top-actions .ghost, .top-actions .ghost-nav { padding-left: 6px; padding-right: 6px; }
 }
 .composer, .output {
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
@@ -196,6 +201,9 @@ textarea { resize: vertical; }
 .printbar .primary { margin-left: auto; }
 .progress { height: 4px; background: var(--surface-2); border-radius: 2px; margin-top: 12px; overflow: hidden; }
 .progress div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.progress-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.progress-row .progress { flex: 1; margin-top: 0; }
+.panel:focus, .viewer:focus { outline: none; }
 
 /* ------------------------------------------------ side panels */
 .scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, .3); z-index: 9; }
@@ -238,6 +246,7 @@ textarea { resize: vertical; }
 .photo .sub { color: var(--muted); font-size: 12px; padding: 6px 8px 0; }
 .photo .actions { display: flex; gap: 2px; padding: 4px 4px 6px; }
 .photo .actions button { flex: 1; padding: 4px 2px; }
+.photos-more { grid-column: 1 / -1; justify-self: center; }
 .setting input[type=range] { width: 160px; }
 .setting input[type=text] { width: 200px; }
 .setting select { width: 200px; }
@@ -262,6 +271,8 @@ textarea { resize: vertical; }
   font-size: 14px; max-width: 90vw; animation: rise .18s ease-out;
 }
 .toast.error { background: var(--danger); color: #fff; }
+.toast-action { margin-left: 8px; padding: 4px 10px; border: 1px solid currentColor; border-radius: 6px;
+  background: transparent; color: inherit; font-weight: 650; cursor: pointer; }
 @keyframes rise { from { transform: translateY(8px); opacity: 0; } }
 
 /* ------------------------------------------------ photo browser (photos.html) */

@@ -206,22 +206,25 @@
       <label>Copies <input type="number" id="copies" min="1" max="20" value="1"></label>
       <button type="button" class="primary" id="print-btn" disabled>Print</button>
     </div>
-    <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
+    <div class="progress-row" id="progress-row" hidden>
+      <div class="progress" id="progress"><div id="progress-bar"></div></div>
+      <button type="button" class="ghost small" id="print-cancel">Cancel</button>
+    </div>
   </aside>
 </main>
 
 <!-- side panels -->
 <div class="scrim" id="scrim" hidden></div>
-<aside class="panel" id="panel-history" hidden>
+<aside class="panel" id="panel-history" role="dialog" aria-label="History" tabindex="-1" hidden>
   <div class="panel-head"><h2>History</h2><button type="button" class="ghost" data-close>Close</button></div>
   <div id="history-list" class="history"></div>
 </aside>
-<aside class="panel" id="panel-automate" hidden>
+<aside class="panel" id="panel-automate" role="dialog" aria-label="Automate" tabindex="-1" hidden>
   <div class="panel-head"><h2>Automate</h2><button type="button" class="ghost" data-close>Close</button></div>
   <div class="automate" id="automate"></div>
 </aside>
 
-<aside class="panel" id="panel-settings" hidden>
+<aside class="panel" id="panel-settings" role="dialog" aria-label="Settings" tabindex="-1" hidden>
   <div class="panel-head"><h2>Settings</h2><button type="button" class="ghost" data-close>Close</button></div>
   <div class="settings">
     <p class="hint">Saved on the print server, so they apply to every print: this app, Home Assistant and scripts.</p>

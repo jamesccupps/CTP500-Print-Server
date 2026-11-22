@@ -18,6 +18,7 @@ from PIL import Image, ImageOps
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\.jpe?g$", re.I)
 THUMB_WIDTH = 240
+MIN_PHOTO_SIDE = 32   # px: smaller isn't a photo (a 1 x 1 picture was taken in, 2026-11-21 review)
 
 
 class CameraGallery:
@@ -51,6 +52,8 @@ class CameraGallery:
                 img.verify()
         except Exception:
             raise ValueError("that isn't a picture the server can read") from None
+        if min(size) < MIN_PHOTO_SIDE:
+            raise ValueError(f"the picture is too small to be a photo ({size[0]} x {size[1]})")
         if fmt != "JPEG":
             from .render import MAX_PICTURE_PIXELS     # it's decoded in full to be stored as a JPEG
             if size[0] * size[1] > MAX_PICTURE_PIXELS:
@@ -93,6 +96,13 @@ class CameraGallery:
                             "download": f"/api/camera/photo/{entry.name}?download=1"})
         out.sort(key=lambda p: (p["taken"], p["name"]), reverse=True)
         return out
+
+    def taken(self, name: str) -> float:
+        """When a photo was taken (as in list()); KeyError if there's no such photo."""
+        path = self.path(name)
+        if not path or not os.path.isfile(path):
+            raise KeyError(name)
+        return self._taken_time(name, path, os.path.getmtime(path))
 
     def _taken_time(self, name: str, path: str, mtime: float) -> float:
         cached = self._taken.get(name)
@@ -305,8 +315,9 @@ def _clean_name(name: str | None) -> str:
     return stem + ".jpg"
 
 
-def print_doc(photo: bytes, name: str, cfg: dict, overrides: dict | None = None) -> dict:
-    """The print for a camera photo, from the camera settings (style, detail, frame, caption)."""
+def print_doc(photo: bytes, name: str, cfg: dict, overrides: dict | None = None, taken: float | None = None) -> dict:
+    """The print for a camera photo, from the camera settings (style, detail, frame, caption). taken: when it was
+    taken (CameraGallery.taken): the caption's {date}, {time}... are that day, not the day it's printed."""
     opts = {"style": cfg.get("camera_style", "photoline"), "detail": cfg.get("camera_detail", 0.5),
             "weight": cfg.get("camera_weight", 2),
             "frame": cfg.get("camera_frame", True), "caption": cfg.get("camera_caption", "{date}"),
@@ -318,6 +329,10 @@ def print_doc(photo: bytes, name: str, cfg: dict, overrides: dict | None = None)
     if _truthy(opts["frame"]):
         block["frame"] = True
         block["caption"] = str(opts["caption"] or "")
+        if taken:
+            import datetime
+            from .render import expand
+            block["caption"] = expand(block["caption"], datetime.datetime.fromtimestamp(taken))
     if _truthy(opts["sideways"]):
         block["sideways"] = True    # landscape shots print along the paper, bigger
     if _truthy(opts["zoom"]):

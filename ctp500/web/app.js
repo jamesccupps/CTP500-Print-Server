@@ -177,10 +177,20 @@ async function doPrint() {
 }
 
 function showProgress(p) {
-  const bar = $("#progress");
-  if (p === null) { bar.hidden = true; return; }
-  bar.hidden = false;
+  const row = $("#progress-row");
+  if (p === null) { row.hidden = true; return; }
+  row.hidden = false;
   $("#progress-bar").style.width = Math.round(p * 100) + "%";
+}
+
+// Cancel next to the progress bar and on History rows: a print waiting for the printer (or a long one, or 20
+// copies) could only be stopped through the API or by restarting the service.
+async function cancelJob(id) {
+  try {
+    await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+    if (id !== state.printing) toast("Canceled");     // the tracked print says so itself once it has stopped
+    setTimeout(() => { if (!$("#panel-history").hidden) loadHistory(); }, 1500);
+  } catch (err) { toast(err.message, "error"); }
 }
 
 // ------------------------------------------------------------------ status
@@ -341,7 +351,7 @@ function switchTab(tab) {
   state.tab = tab;
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === tab));
   $$(".pane").forEach(p => p.classList.toggle("active", p.dataset.pane === tab));
-  if (tab === "camera") loadPhotos();
+  if (tab === "camera") loadPhotos(); else stopCountdown();
   if (tab !== "templates") schedulePreview(0);
 }
 
@@ -352,9 +362,37 @@ function withToken(url) {          // plain links can't send the Authorization h
   return token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url;
 }
 
+// The newest photos only: the rest are in the photo browser (2,000 photos built 16,000 elements here).
+const CAMERA_TAB_PHOTOS = 24;
+
+// Print on a photo waits 3 seconds, counting down, before anything is sent, as in the photo browser: a stray tap
+// on a phone printed (the buttons are small and side by side). Tapping it again cancels.
+let countdown = null;
+function printAfterCountdown(btn, send) {
+  const again = countdown && countdown.btn === btn;
+  stopCountdown();
+  if (again) { toast("Print canceled"); return; }
+  let left = 3;
+  const label = btn.textContent;
+  const show = () => { btn.textContent = `${left}… tap to cancel`; };
+  show();
+  countdown = { btn, label, timer: setInterval(() => {
+    if (--left > 0) { show(); return; }
+    stopCountdown();
+    send();
+  }, 1000) };
+}
+function stopCountdown() {
+  if (!countdown) return;
+  clearInterval(countdown.timer);
+  countdown.btn.textContent = countdown.label;
+  countdown = null;
+}
+
 async function loadPhotos() {
   const box = $("#photos");
   $("#photos-zip").href = withToken("/api/camera/photos.zip");
+  stopCountdown();
   try {
     const { photos } = await api("/api/camera/photos");
     box.replaceChildren();
@@ -362,7 +400,7 @@ async function loadPhotos() {
       box.innerHTML = '<div class="empty">No photos yet. Hold OK on the camera to send its photos here.</div>';
       return;
     }
-    for (const p of photos) {
+    for (const p of photos.slice(0, CAMERA_TAB_PHOTOS)) {
       const card = document.createElement("div");
       card.className = "photo";
       card.innerHTML = '<img loading="lazy" alt=""><div class="sub"></div><div class="actions">' +
@@ -374,12 +412,13 @@ async function loadPhotos() {
       card.querySelector('[data-act="save"]').href = withToken(p.download);
       card.querySelector('[data-act="save"]').setAttribute("download", p.name);
       card.querySelector(".sub").textContent = timeAgo(p.time);
-      card.querySelector('[data-act="print"]').onclick = async () => {
+      const printBtn = card.querySelector('[data-act="print"]');
+      printBtn.onclick = () => printAfterCountdown(printBtn, async () => {
         try {
           const { job } = await api(`/api/camera/photo/${encodeURIComponent(p.name)}/print`, { method: "POST" });
           state.printing = job.id; showProgress(0); pollStatus(true);
         } catch (err) { toast(err.message, "error"); }
-      };
+      });
       card.querySelector('[data-act="edit"]').onclick = async () => {
         try {
           const res = await api(p.url, { raw: true });
@@ -387,13 +426,21 @@ async function loadPhotos() {
         } catch (err) { toast(err.message, "error"); }
       };
       card.querySelector('[data-act="delete"]').onclick = async () => {
-        if (!confirm("Delete this photo from the print server? (It stays on the camera's SD card.)")) return;
+        if (!confirm("Delete this photo from the print server, with its prints in History? (It stays on the camera's " +
+                     "SD card.)")) return;
         try {
           await api(`/api/camera/photo/${encodeURIComponent(p.name)}/delete`, { method: "POST" });
           loadPhotos();
         } catch (err) { toast(err.message, "error"); }
       };
       box.append(card);
+    }
+    if (photos.length > CAMERA_TAB_PHOTOS) {
+      const more = document.createElement("a");
+      more.className = "button-link photos-more";
+      more.href = "/photos";
+      more.textContent = `All ${photos.length} photos in the photo browser`;
+      box.append(more);
     }
   } catch (err) {
     box.innerHTML = '<div class="empty"></div>';
@@ -474,9 +521,19 @@ function setQrKind(kind) {
 
 // ------------------------------------------------------------------ panels
 
+// A side panel takes the keyboard focus, keeps it (the page behind is out of reach while it's open) and gives it
+// back to the button that opened it.
+let panelOpener = null;
+function setBehind(off) {
+  for (const el of [$("header.top"), $("main.layout")]) el.inert = off;
+}
+
 function openPanel(name) {
+  if ($$(".panel").every(p => p.hidden)) panelOpener = document.activeElement;
   $("#scrim").hidden = false;
   $$(".panel").forEach(p => { p.hidden = p.id !== "panel-" + name; });
+  setBehind(true);
+  $("#panel-" + name).focus();
   if (name === "history") loadHistory();
   if (name === "automate") renderAutomate();
   if (name === "settings") loadSettings();
@@ -560,7 +617,15 @@ function stepSetting(id, by) {
   input.value = next;
   saveSettingsSoon();
 }
-function closePanels() { $("#scrim").hidden = true; $$(".panel").forEach(p => { p.hidden = true; }); }
+function closePanels() {
+  const wasOpen = $$(".panel").some(p => !p.hidden);
+  $("#scrim").hidden = true;
+  $$(".panel").forEach(p => { p.hidden = true; });
+  if (!wasOpen) return;
+  setBehind(false);
+  if (panelOpener && panelOpener.isConnected) panelOpener.focus();
+  panelOpener = null;
+}
 
 function timeAgo(t) {
   const s = Math.round(Date.now() / 1000 - t);
@@ -579,8 +644,10 @@ async function loadHistory() {
     for (const j of jobs) {
       const row = document.createElement("div");
       row.className = "job";
-      row.innerHTML = '<img loading="lazy" alt=""><div><div class="title"></div><div class="sub"></div></div><button type="button" class="ghost small">Reprint</button>';
-      row.querySelector("img").src = j.preview;
+      row.innerHTML = '<img loading="lazy" alt=""><div><div class="title"></div><div class="sub"></div></div>';
+      const img = row.querySelector("img");
+      if (j.preview) img.src = withToken(j.preview);
+      else img.style.visibility = "hidden";           // its photo was deleted, and with it this copy
       row.querySelector(".title").textContent = j.title || "Print";
       const sub = row.querySelector(".sub");
       const on = state.printers.length > 1 && j.printer ? ` · ${(state.printers.find(p => p.id === j.printer) || {}).label || j.printer}` : "";
@@ -589,12 +656,21 @@ async function loadHistory() {
       st.textContent = j.status === "failed" || j.status === "waiting" ? `${j.status}: ${j.error || ""}` : j.status;
       if (j.status === "failed" || j.status === "waiting") st.className = "failed";
       sub.append(st);
-      row.querySelector("button").onclick = async () => {
-        try {
-          const { job } = await api(`/api/jobs/${j.id}/reprint`, { method: "POST" });
-          state.printing = job.id; showProgress(0); pollStatus(true); toast("Reprinting");
-        } catch (err) { toast(err.message, "error"); }
-      };
+      if (j.photo_deleted) sub.append(" · photo deleted");
+      const unfinished = ["queued", "printing", "waiting"].includes(j.status);
+      if (unfinished || !j.photo_deleted) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "ghost small";
+        btn.textContent = unfinished ? "Cancel" : "Reprint";
+        btn.onclick = unfinished ? () => cancelJob(j.id) : async () => {
+          try {
+            const { job } = await api(`/api/jobs/${j.id}/reprint`, { method: "POST" });
+            state.printing = job.id; showProgress(0); pollStatus(true); toast("Reprinting");
+          } catch (err) { toast(err.message, "error"); }
+        };
+        row.append(btn);
+      }
       list.append(row);
     }
   } catch (err) {
@@ -703,6 +779,7 @@ function init() {
 
   $$("#qr-kind button").forEach(b => b.addEventListener("click", () => setQrKind(b.dataset.kind)));
   $("#print-btn").addEventListener("click", doPrint);
+  $("#print-cancel").addEventListener("click", () => { if (state.printing) cancelJob(state.printing); });
   document.addEventListener("keydown", e => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doPrint(); }
     if (e.key === "Escape") closePanels();

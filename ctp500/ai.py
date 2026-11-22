@@ -36,7 +36,10 @@ MODELS = {
 _sessions: dict = {}
 _lock = threading.Lock()
 PROVIDERS = ["CPUExecutionProvider"]   # the PC helper puts its graphics card (CUDA) first
-RUN_OPTIONS = None    # the PC helper's onnxruntime.RunOptions: its GPU memory pool is given back after each run
+# onnxruntime.RunOptions for every run: made with the first session so the memory pool is given back after each run
+# (each model kept ~0.7 GB after its first drawing otherwise, for good; ~7% slower). The PC helper sets its own
+# (its GPU pool too).
+RUN_OPTIONS = None
 
 # The model's cost grows with its pixel count; past this width a 48 mm print gains nothing. Sideways prints asked
 # for ~830 px and took ~5 s per drawing on the Pi (2026-10-30); 640 cuts that by ~40%.
@@ -97,9 +100,13 @@ def available(name: str = "lineart") -> bool:
 
 
 def _session(name: str):
+    global RUN_OPTIONS
     with _lock:
         if name not in _sessions:
             import onnxruntime as ort
+            if RUN_OPTIONS is None:
+                RUN_OPTIONS = ort.RunOptions()
+                RUN_OPTIONS.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
             opts = ort.SessionOptions()
             opts.log_severity_level = 3
             _sessions[name] = ort.InferenceSession(model_path(name), opts, providers=PROVIDERS)

@@ -1,6 +1,7 @@
 """The Phomemo M02 Pro and running more than one printer."""
 
 import errno
+import importlib.util
 import io
 import json
 import os
@@ -124,6 +125,7 @@ class M02ProPrinterTests(unittest.TestCase):
 
 
 class ScaledLayoutTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("qrcode"), "needs the qrcode package")
     def test_same_size_on_paper(self):
         doc = {"blocks": [{"type": "heading", "text": "Title"}, {"type": "text", "text": "a line of text"},
                           {"type": "qr", "data": "https://example.com"}, {"type": "line"}]}

@@ -77,14 +77,20 @@ class Job:
         self.cancel = threading.Event()
         self.finished = threading.Event()
         self.image: Image.Image | None = None
+        # the gallery photo it prints, if any: deleting the photo deletes its copies here too (PrintService.
+        # delete_photo); None = not known (history saved before 1.3.0: read from its file when asked)
+        self.photo = next((str(b["name"]) for b in doc.get("blocks", []) if isinstance(b, dict)
+                           and b.get("type") == "image" and b.get("name")), "")
+        self.photo_deleted = False
 
     def as_dict(self) -> dict:
         return {
             "id": self.id, "title": self.title, "source": self.source, "created": self.created,
             "status": self.status, "error": self.error, "progress": round(self.progress, 3),
             "height": self.height, "length_mm": round(self.height * 25.4 / self.dpi), "dpi": self.dpi,
-            "printer": self.printer, "copies": self.copies, "darkness": self.darkness,
-            "preview": f"/api/jobs/{self.id}.png",
+            "printer": self.printer, "copies": self.copies, "darkness": self.darkness, "feed": self.feed,
+            "photo": self.photo, "photo_deleted": self.photo_deleted,
+            "preview": None if self.photo_deleted else f"/api/jobs/{self.id}.png",
         }
 
 
@@ -136,6 +142,7 @@ class PrintService:
         os.makedirs(self.jobs_dir, exist_ok=True)
         # history is shared by the HTTP threads and the print worker: always under _lock
         self._lock = threading.Lock()
+        self._index_lock = threading.Lock()    # one writer of jobs/index.json at a time
         self.history: collections.OrderedDict[str, Job] = collections.OrderedDict()
         self.queues: dict[str, queue.Queue[Job]] = {pid: queue.Queue() for pid in self.printers}
         self.started = time.time()
@@ -268,6 +275,11 @@ class PrintService:
         with self._lock:
             self.history[job.id] = job
             self._trim_history()
+        try:                                # on disk before it's queued: a restart while it waits keeps it
+            self._save_doc(job)
+            self._write_index()
+        except OSError:
+            traceback.print_exc()
         self.queues[printer.id].put(job)
         return job
 
@@ -281,6 +293,8 @@ class PrintService:
         old = self.job(job_id)
         if old is None:
             raise KeyError(job_id)
+        if old.photo_deleted:
+            raise ValueError("its photo was deleted")
         doc = old.doc
         if doc is None:
             path = os.path.join(self.jobs_dir, f"{job_id}.json")
@@ -300,6 +314,53 @@ class PrintService:
     def jobs(self) -> list[Job]:
         with self._lock:
             return list(self.history.values())
+
+    def delete_photo(self, name: str) -> int:
+        """Delete a gallery photo and every copy of it in History: each print's file keeps the whole photo for
+        reprints, so it stayed printable (and on the card) until 100 newer prints pushed it out. The rows stay,
+        without the picture or Reprint; a print of it still waiting is cancelled. Returns how many prints had it."""
+        self.camera.delete(name)                            # KeyError: no such photo
+        hits = 0
+        for job in self.jobs():
+            if job.photo is None:                           # saved before 1.3.0: look in its file
+                job.photo = self._photo_in_file(job.id)
+            if job.photo != name or job.photo_deleted:
+                continue
+            hits += 1
+            job.photo_deleted = True
+            if job.finished.is_set():
+                self._forget_files(job)
+            else:
+                job.cancel.set()                            # its files go when it ends (_save_job)
+        with self._lock:                                    # the drawn previews of it, kept for the Photos page
+            for key in [k for k in self._previews if k and k[0] == name]:
+                del self._previews[key]
+        try:
+            self._write_index()
+        except OSError:
+            traceback.print_exc()
+        return hits
+
+    def _photo_in_file(self, job_id: str) -> str:
+        try:
+            with open(os.path.join(self.jobs_dir, f"{job_id}.json"), encoding="utf-8") as f:
+                doc = json.load(f)
+            return next((str(b["name"]) for b in doc.get("blocks", []) if isinstance(b, dict)
+                         and b.get("type") == "image" and b.get("name")), "")
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def _forget_files(self, job: Job) -> None:
+        job.doc = job.image = None
+        for ext in (".png", ".json"):
+            try:
+                os.remove(os.path.join(self.jobs_dir, job.id + ext))
+            except OSError:
+                pass
+
+    def waiting_on(self, printer_id: str) -> bool:
+        """Whether a print is waiting for this printer (no paper, lid open, off)."""
+        return any(j.printer == printer_id and j.status == "waiting" for j in self.jobs())
 
     def cancel(self, job_id: str) -> Job:
         job = self.job(job_id)
@@ -414,26 +475,44 @@ class PrintService:
 
     # ------------------------------------------------------------ history on disk
 
-    def _save_job(self, job: Job) -> None:
-        try:
-            with open(os.path.join(self.jobs_dir, f"{job.id}.json"), "w", encoding="utf-8") as f:
-                json.dump(job.doc, f)
-            job.doc = None  # reprints read it back from disk; keeps big pictures out of memory
-            index = [j.as_dict() for j in self.jobs() if j.finished.is_set()]
+    def _save_doc(self, job: Job) -> None:
+        """The document (with any picture in it), for reprints and for a restart while it waits."""
+        with open(os.path.join(self.jobs_dir, f"{job.id}.json"), "w", encoding="utf-8") as f:
+            json.dump(job.doc, f)
+
+    def _write_index(self) -> None:
+        """index.json: every job, finished or not (one still queued or waiting is queued again after a restart)."""
+        with self._index_lock:
+            index = [j.as_dict() for j in self.jobs()]
             tmp = os.path.join(self.jobs_dir, "index.json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(index, f)
             os.replace(tmp, os.path.join(self.jobs_dir, "index.json"))
+
+    def _save_job(self, job: Job) -> None:
+        """A job has ended."""
+        try:
+            if job.photo_deleted:
+                self._forget_files(job)
+            elif not os.path.exists(os.path.join(self.jobs_dir, f"{job.id}.json")):
+                self._save_doc(job)
+            job.doc = None  # reprints read it back from disk; keeps big pictures out of memory
+            self._write_index()
         except OSError:
             traceback.print_exc()
 
     def _load_history(self) -> None:
+        """History from the last run. Prints still queued or waiting when it stopped are queued again while their
+        retry time lasts (a restart while the paper was out used to lose them without a word); one that was being
+        printed is marked failed instead (part of it may be out: reprint it). Job files nothing points to go."""
         path = os.path.join(self.jobs_dir, "index.json")
         try:
             with open(path, encoding="utf-8") as f:
                 entries = json.load(f)
         except (OSError, ValueError):
-            return
+            entries = []
+        retry_s = 60 * float(self.cfg.get("retry_minutes", 30) or 0)
+        again, changed = [], False
         for entry in entries[-int(self.cfg.get("history", 100)):]:
             job = Job.__new__(Job)
             job.__dict__.update({
@@ -442,11 +521,42 @@ class PrintService:
                 "error": entry.get("error"), "progress": entry.get("progress", 1.0),
                 "height": entry.get("height", 0), "copies": entry.get("copies", 1),
                 "printer": entry.get("printer") or self.printer.id, "dpi": entry.get("dpi", protocol.DPI),
-                "darkness": entry.get("darkness"), "feed": 4, "image": None,
+                "darkness": entry.get("darkness"), "feed": entry.get("feed", 4), "image": None,
+                "photo": entry.get("photo"), "photo_deleted": bool(entry.get("photo_deleted")),
                 "cancel": threading.Event(), "finished": threading.Event(),
             })
+            if job.status in ("queued", "waiting"):
+                doc = None
+                if time.time() < job.created + retry_s and job.printer in self.printers and not job.photo_deleted:
+                    try:
+                        with open(os.path.join(self.jobs_dir, f"{job.id}.json"), encoding="utf-8") as f:
+                            doc = json.load(f)
+                    except (OSError, ValueError):
+                        pass
+                if isinstance(doc, dict):
+                    job.doc, job.status, job.progress = doc, "queued", 0.0
+                    self.history[job.id] = job
+                    again.append(job)
+                    continue
+                job.status, job.error, changed = "failed", "the print server restarted while it waited; reprint it", True
+            elif job.status == "printing":
+                job.status, job.error, changed = "failed", "the print server restarted while it printed; reprint it", True
             job.finished.set()
             self.history[job.id] = job
+        for job in again:
+            self.queues[job.printer].put(job)
+        try:                                # pictures of prints the history no longer has (lost by a restart)
+            for item in os.scandir(self.jobs_dir):
+                stem, ext = os.path.splitext(item.name)
+                if ext in (".png", ".json") and stem != "index" and stem not in self.history:
+                    os.remove(item.path)
+        except OSError:
+            traceback.print_exc()
+        if again or changed:
+            try:
+                self._write_index()
+            except OSError:
+                traceback.print_exc()
 
     def _trim_history(self) -> None:
         limit = max(10, int(self.cfg.get("history", 100)))
@@ -547,7 +657,7 @@ class PrintService:
 
     def camera_print(self, name: str, overrides: dict | None = None, source: str = "camera") -> Job:
         """Drawn by the print worker: the caller (the camera, the Photos page) gets its answer at once."""
-        doc = camera.print_doc(self.camera.read(name), name, self.cfg, overrides)
+        doc = camera.print_doc(self.camera.read(name), name, self.cfg, overrides, self.camera.taken(name))
         doc["printer"] = self.camera_printer(overrides).id
         return self.submit(doc, source, render_now=False)
 
@@ -559,7 +669,8 @@ class PrintService:
             self._last_preview = time.monotonic()
         printer = self.camera_printer(overrides)
         data = self.camera.read(name)
-        doc = render.with_defaults(camera.print_doc(data, name, self.cfg, overrides), self.cfg, printer.paper)
+        doc = render.with_defaults(camera.print_doc(data, name, self.cfg, overrides, self.camera.taken(name)),
+                                   self.cfg, printer.paper)
         shape = {k: v for k, v in doc["blocks"][0].items() if k != "data"}
         shape["printer"] = printer.id   # in the cache key: each printer has its own paper
         # placeholders expanded, so a {time} caption isn't served stale
@@ -1020,9 +1131,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"name": name, "job": svc.camera_print(name, overrides).as_dict()})
         if path.startswith("/api/camera/photo/") and path.endswith(("/print", "/delete", "/preview")):
             name = path[len("/api/camera/photo/"):].rsplit("/", 1)[0]
-            if path.endswith("/delete"):
-                svc.camera.delete(name)
-                return self._json(200, {"deleted": name})
+            if path.endswith("/delete"):         # from History too
+                return self._json(200, {"deleted": name, "prints": svc.delete_photo(name)})
             body = self._json_body() if self._body() else {}
             overrides = {k: v for k, v in {**query, **(body if isinstance(body, dict) else {})}.items()
                          if k in CAMERA_OVERRIDES}
@@ -1057,8 +1167,11 @@ class Handler(BaseHTTPRequestHandler):
     def _queued(self, job: Job, query: dict):
         if query.get("wait") in ("1", "true", "yes"):
             until = time.monotonic() + max(0.0, min(600.0, float(query.get("timeout", 120))))
-            while not job.finished.wait(0.2) and job.status != "waiting" and time.monotonic() < until:
-                pass                        # answers when it's printed, or waiting for the printer
+            # answers when it's printed, or waiting for the printer, or queued behind a print that is (it would
+            # sit out the whole timeout: longer than a Home Assistant call waits)
+            while not job.finished.wait(0.2) and job.status != "waiting" and \
+                    not self.service.waiting_on(job.printer) and time.monotonic() < until:
+                pass
             code = 200 if job.status == "done" else (202 if job.status in ("queued", "printing", "waiting") else 502)
             return self._json(code, {"job": job.as_dict()})
         return self._json(202, {"job": job.as_dict()})

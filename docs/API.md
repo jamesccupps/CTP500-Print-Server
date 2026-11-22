@@ -4,7 +4,8 @@ Everything the web app does goes through this API, so scripts, Home Assistant or
 request can print. The server listens on port 8500.
 
 - Print calls answer right away with the job (`202`). Add `?wait=1` to answer after printing (`200`, or `502` with
-  the error).
+  the error); a print that waits for the printer (no paper, lid open, off), or is queued behind one that does,
+  answers `202` at once. Waiting prints keep trying for `retry_minutes` (30), also across a restart of the server.
 - Every print call takes `darkness` (`light`, `normal`, `dark`, `darkest`, 0–255, or `auto`), `copies` (1–20)
   and `feed` (0–40 lines of about 4 mm).
 - With [more than one printer](../README.md#a-second-printer-phomemo-m02-pro), every print call also takes
@@ -30,7 +31,8 @@ request can print. The server listens on port 8500.
 | `GET /api/status` | `printer` (the main one), `printers` (all of them: `id`, `label`, `model`, `width`, `dpi`, `paper_mm`, state), `camera_printer`, queue, version, PC helper |
 | `GET /api/settings`, `POST /api/settings` | padding (`padding_top_mm`, `padding_bottom_mm`, 0–50), `photo_look` (`punchy`/`even`), camera print settings, `camera_printer` (a printer id, or `""` for the main one) |
 | `POST /api/check` | connect to the printer now (`?printer=`) |
-| `GET /api/jobs`, `GET /api/jobs/<id>.png`, `POST /api/jobs/<id>/reprint`, `POST /api/jobs/<id>/cancel` | history; each job says which `printer` it went to, and a reprint goes there too (or `?printer=` another) |
+| `POST /api/disconnect` | let go of the printer's Bluetooth connection now instead of after `keep_alive` seconds, so another device can connect (`?printer=`; the next print connects again) |
+| `GET /api/jobs`, `GET /api/jobs/<id>.png`, `POST /api/jobs/<id>/reprint`, `POST /api/jobs/<id>/cancel` | history; each job says which `printer` it went to, and a reprint goes there too (or `?printer=` another); `cancel` stops a print that's queued, waiting or printing; a print of a deleted photo has `"photo_deleted": true` and can't be reprinted |
 
 ```sh
 curl --data-binary "# Hello" http://<server>:8500/api/print/text
@@ -75,7 +77,7 @@ so a layout comes out the same size on either printer; `/api/preview` answers wi
 | `GET /api/camera/photo/<name>` (`?download=1`), `/api/camera/thumb/<name>`, `/api/camera/photos.zip` | the original, a thumbnail, all of them |
 | `POST /api/camera/photo/<name>/print` | print it (`style`, `detail`, `weight`, `frame`, `caption`, `sideways`, `zoom`, `sharpen`, `printer` override the settings) |
 | `POST /api/camera/photo/<name>/preview` | the PNG it would print (same options) |
-| `POST /api/camera/photo/<name>/delete` | delete it from the server |
+| `POST /api/camera/photo/<name>/delete` | delete it from the server, with its copies in History (`prints`: how many) |
 | `GET /api/camera/litho/<name>.png`, `.stl`, `.3mf` | lithophane preview, 3D model, ready-to-print file (needs the PC helper); `?size=` long side in mm (30–170), `?shape=flat\|curved\|relief` |
 
 ## PC helper

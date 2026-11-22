@@ -1,5 +1,6 @@
 import base64
 import datetime as dt
+import importlib.util
 import io
 import json
 import os
@@ -152,6 +153,7 @@ class MarkupTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("qrcode"), "needs the qrcode package")
     def test_every_block_type_is_full_width_1bit(self):
         doc = {"blocks": [
             {"type": "heading", "text": "Hello"},
@@ -218,6 +220,8 @@ class RenderTests(unittest.TestCase):
         ImageDraw.Draw(img).ellipse([100, 50, 300, 250], outline="black", width=6)
         drawing = ai.draw(img, "lineart", 400)
         self.assertEqual((drawing.mode, drawing.size), ("L", (400, 300)))
+        if ai.available("lineart") and "lineart" in ai._sessions:      # drawn here by the model
+            self.assertIsNotNone(ai.RUN_OPTIONS)                         # its memory pool is given back after a run
         for weight in (1, 2, 3):
             bw = styles.apply_ai(img, "line", 384, 0.5, weight)
             self.assertEqual((bw.mode, bw.width), ("1", 384))
@@ -423,7 +427,7 @@ class ServerTests(unittest.TestCase):
         reply = json.loads(body)
         self.assertEqual((code, reply["name"]), (200, "IMG00008.jpg"))
         job = json.loads(self.call(f"/api/jobs/{reply['job']['id']}")[1])
-        for _ in range(100):
+        for _ in range(300):       # an AI drawing: slow on a busy Pi
             if job["status"] in ("done", "failed"):
                 break
             threading.Event().wait(0.05)
@@ -657,7 +661,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(reply["job"]["height"], 0)                        # drawn by the print worker, later
         job_id = reply["job"]["id"]
-        for _ in range(100):
+        for _ in range(300):       # an AI drawing: slow on a busy Pi
             job = json.loads(self.call("/api/jobs/" + job_id)[1])
             if job["status"] not in ("queued", "printing"):
                 break
@@ -848,6 +852,105 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(jobs[0]["title"], "remember me")
         code, body, _ = self.call(f"/api/jobs/{jobs[0]['id']}/reprint?wait=1", {})
         self.assertEqual((code, json.loads(body)["job"]["status"]), (200, "done"))
+
+    def _quiet_old_service(self):
+        """Before a restart in a test: the stopped server's print worker would keep trying its jobs and write the
+        same jobs folder; cancel them without letting it write anything."""
+        old = self.httpd.service
+        old._save_job = lambda job: None
+        old._write_index = lambda: None
+        for job in old.jobs():
+            job.cancel.set()
+
+    def test_waiting_prints_survive_a_restart(self):
+        service = self.httpd.service
+        service.RETRY_EVERY = 0.1
+        service.printer.transport.state_flags = 0x01                       # no paper
+        waiting = json.loads(self.call("/api/print/text?wait=1", b"keep me")[1])["job"]
+        self.assertEqual(waiting["status"], "waiting")
+        t = time.monotonic()                                               # queued behind it: answers at once,
+        code, body, _ = self.call("/api/print/text?wait=1", b"behind it")   # not after the 120 s timeout
+        behind = json.loads(body)["job"]
+        self.assertEqual((code, behind["status"]), (202, "queued"))
+        self.assertLess(time.monotonic() - t, 5)
+        self.stop()
+        self._quiet_old_service()
+        jobs_dir = service.jobs_dir
+        with open(os.path.join(jobs_dir, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        for status, ago in (("printing", 5), ("waiting", 3600)):            # cut off mid-print; waited too long
+            entry = dict(index[0], id=f"0101000000-{status}", status=status, created=time.time() - ago)
+            index.append(entry)
+            with open(os.path.join(jobs_dir, entry["id"] + ".json"), "w") as f:
+                json.dump({"blocks": [{"type": "text", "text": status}]}, f)
+        with open(os.path.join(jobs_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        with open(os.path.join(jobs_dir, "0101000000-9.png"), "wb") as f:  # a picture nothing points to
+            f.write(b"x")
+        self.start()                                                       # with paper again (a new printer)
+        for _ in range(100):
+            states = [json.loads(self.call("/api/jobs/" + j["id"])[1])["status"] for j in (waiting, behind)]
+            if states == ["done", "done"]:
+                break
+            time.sleep(0.1)
+        self.assertEqual(states, ["done", "done"])
+        for status, why in (("printing", "while it printed"), ("waiting", "while it waited")):
+            job = json.loads(self.call(f"/api/jobs/0101000000-{status}")[1])
+            self.assertEqual(job["status"], "failed")
+            self.assertIn(why, job["error"])
+        self.assertFalse(os.path.exists(os.path.join(jobs_dir, "0101000000-9.png")))
+
+    def test_deleting_a_photo_deletes_its_prints_in_history(self):
+        svc = self.httpd.service
+        names = [json.loads(self.call("/api/camera/upload", self._jpeg(color),
+                                      headers={"X-Filename": f"IMG_2026110{i}_100000.jpg"})[1])["name"]
+                 for i, color in ((1, "gray"), (2, "black"))]
+        jobs = [json.loads(self.call(f"/api/camera/photo/{n}/print?wait=1", {})[1])["job"] for n in names]
+        self.assertEqual([j["status"] for j in jobs], ["done", "done"])
+        note = json.loads(self.call("/api/print/text?wait=1", b"not a photo")[1])["job"]
+        files = lambda job_id: [os.path.exists(os.path.join(svc.jobs_dir, job_id + ext)) for ext in (".json", ".png")]
+        self.assertEqual(files(jobs[0]["id"]), [True, True])
+        code, body, _ = self.call(f"/api/camera/photo/{names[0]}/delete", method="POST")
+        self.assertEqual((code, json.loads(body)["prints"]), (200, 1))
+        self.assertEqual(files(jobs[0]["id"]), [False, False])             # the copy of the photo is gone
+        row = json.loads(self.call("/api/jobs/" + jobs[0]["id"])[1])
+        self.assertEqual((row["photo_deleted"], row["preview"], row["status"]), (True, None, "done"))
+        code, body, _ = self.call(f"/api/jobs/{jobs[0]['id']}/reprint", {})
+        self.assertEqual(code, 400)
+        self.assertIn("deleted", json.loads(body)["error"])
+        self.assertEqual(self.call(f"/api/jobs/{note['id']}/reprint?wait=1", {})[0], 200)   # the rest stays
+        # after a restart: still marked; and history saved before 1.3.0 (no "photo" in the index) is looked up in
+        # each print's file
+        self.stop()
+        self._quiet_old_service()
+        path = os.path.join(svc.jobs_dir, "index.json")
+        with open(path, encoding="utf-8") as f:
+            index = json.load(f)
+        for entry in index:
+            if entry["id"] == jobs[1]["id"]:
+                del entry["photo"]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        self.start()
+        self.assertTrue(json.loads(self.call("/api/jobs/" + jobs[0]["id"])[1])["photo_deleted"])
+        code, body, _ = self.call(f"/api/camera/photo/{names[1]}/delete", method="POST")
+        self.assertEqual((code, json.loads(body)["prints"]), (200, 1))
+        self.assertEqual(files(jobs[1]["id"]), [False, False])
+
+    def test_tiny_pictures_and_the_caption_date(self):
+        tiny = io.BytesIO()
+        Image.new("RGB", (1, 1)).save(tiny, "PNG")
+        code, body, _ = self.call("/api/camera/upload", tiny.getvalue(), headers={"X-Filename": "dot.png"})
+        self.assertEqual(code, 400)
+        self.assertIn("too small", json.loads(body)["error"])
+        from ctp500 import camera
+        name = json.loads(self.call("/api/camera/upload", self._jpeg(),
+                                    headers={"X-Filename": "IMG_20250704_101500.jpg"})[1])["name"]
+        taken = self.httpd.service.camera.taken(name)
+        cfg = {"camera_frame": True, "camera_caption": "{date}, {time}"}
+        doc = camera.print_doc(self._jpeg(), name, cfg, None, taken)       # printed later: the day it was taken
+        self.assertEqual(doc["blocks"][0]["caption"], "Jul 4, 2025, 10:15 AM")
+        self.assertEqual(camera.print_doc(self._jpeg(), name, cfg)["blocks"][0]["caption"], "{date}, {time}")
 
 
 class ToneTests(unittest.TestCase):

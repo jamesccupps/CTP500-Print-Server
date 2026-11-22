@@ -13,6 +13,7 @@
 <header class="top">
   <a class="brand" href="/" title="Back to the printer app"><img src="icon.svg" alt="" width="28" height="28"><span>CTP500</span></a>
   <h1 class="page-title">Photos <span id="count" class="muted"></span></h1>
+  <button class="status" id="status" type="button" hidden><span class="dot"></span><span id="status-text"></span></button>
   <nav class="top-actions">
     <button type="button" class="ghost" id="camera-btn" title="Take a photo with this phone's camera">Take photo</button>
     <button type="button" class="ghost" id="upload-btn">Upload</button>
@@ -35,7 +36,7 @@
 <div class="drop-overlay" id="drop-overlay" hidden>Drop photos to upload</div>
 <div class="progress page-progress" id="upload-progress" hidden><div id="upload-bar"></div></div>
 
-<div class="viewer" id="viewer" hidden>
+<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="Photo" tabindex="-1" hidden>
   <div class="viewer-bar">
     <span id="viewer-count"></span>
     <span class="viewer-when" id="viewer-when"></span>
